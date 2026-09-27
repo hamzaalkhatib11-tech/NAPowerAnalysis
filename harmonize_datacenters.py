@@ -7,21 +7,27 @@ Grid Headroom Stress Index (PROJECT_HANDOFF.md §4, steps 1-10):
    1. Load the global directory (datacenters.geojson, or datacenters.kml as a
       fallback) filtered to U.S. + Canada, and the IM3 atlas. Apply the manual
       geocode fixes in config.GEOCODE_FIXES.
-   2. Estimate MW = sqft x W_PER_SQFT (IM3 rows); everything else is "unknown".
+   2. Estimate MW = sqft x W_PER_SQFT for IM3 *building* records. IM3 "campus"
+      records carry the whole site's land area, not floor area, so they get no
+      MW (mw_method = campus_land_area_excluded); everything else is "unknown".
    3. Drop U.S./Canada-labelled records whose coordinates fall outside the
       North America bbox -> flagged_bad_geocodes.csv.
    4. Point-in-polygon joins: BA (HIFLD Control Areas), state (TIGER),
       province (StatCan).
-   5. Spatial dedup within DEDUP_RADIUS_M, preferring the row that has MW.
+   5. Spatial dedup within DEDUP_RADIUS_M (see dedupe_points): IM3 buildings
+      on the same campus are merged with their MW summed; directory/campus
+      records that overlap an IM3 building are dropped as cross-source dupes.
    6. QA: point MW vs databricks.csv state totals -> qa_state_mw_totals.csv.
-   7. Hybrid per-state scaling: adjusted = max(point sum, databricks total)
-      -> adjusted_baseline_load_by_state.csv.
+   7. Hybrid per-state scaling against the databricks *Active* total only:
+      adjusted = max(point sum, active total) -> adjusted_baseline_load_by_state.csv.
    8. BA stress index, scaling each point by ITS OWN joined state's factor
       (not the BA's single HIFLD STATE field) -> ba_level_stress_index.csv.
    9. Canada province summary and the 2035 growth layer reprojected to WGS84.
 
-Stress Index = scaled DC load / available headroom, where headroom is HIFLD
-AVAIL_CAP when present, otherwise TOTAL_CAP - PEAK_LOAD.
+ba_level_stress_index.csv is the static HIFLD (2020-vintage) snapshot kept for
+comparison with the handoff: scaled DC load / HIFLD AVAIL_CAP. The canonical
+year-by-year index, with capacity rolled forward from EIA-860M and a headroom
+denominator, is built by us_time_series.py.
 """
 
 import html
@@ -31,21 +37,19 @@ import sys
 
 import numpy as np
 import pandas as pd
-import shapefile
-import shapely
-from pyproj import CRS, Transformer
+from pyproj import Transformer
 from sklearn.neighbors import BallTree
 
 from config import (
-    CONTROL_AREAS_FALLBACK_CRS, CONTROL_AREAS_SHP, DATABRICKS_CSV, DATACENTERS_GEOJSON,
-    DATACENTERS_KML, DEDUP_RADIUS_M, EARTH_RADIUS_M, GEOCODE_FIXES, GROWTH_GEOJSON,
-    HIFLD_NULL, IM3_CSV, NA_BBOX_LAT, NA_BBOX_LON, NORTH_AMERICA_COUNTRIES, OUT_DIR,
-    STATCAN_PROVINCES_ZIP, TIGER_STATES_ZIP, W_PER_SQFT,
+    DATABRICKS_BASELINE_STAGES, DATABRICKS_CSV, DATACENTERS_GEOJSON, DATACENTERS_KML,
+    DEDUP_RADIUS_M, EARTH_RADIUS_M, GEOCODE_FIXES, GROWTH_GEOJSON, IM3_CSV,
+    IM3_EXCLUDED_TYPES, NA_BBOX_LAT, NA_BBOX_LON, NORTH_AMERICA_COUNTRIES, OUT_DIR, W_PER_SQFT,
 )
+from geo import join_ba, join_province, join_state, load_control_areas
 
 POINT_COLUMNS = [
     "source", "name", "company", "city", "state", "country", "address",
-    "lat", "lon", "sqft", "status",
+    "lat", "lon", "sqft", "status", "im3_type",
 ]
 
 
@@ -72,8 +76,10 @@ def load_datacenters_geojson(path) -> pd.DataFrame:
             "lon": lon,
             "sqft": np.nan,
             "status": np.nan,
+            "im3_type": np.nan,
         })
     df = pd.DataFrame(rows, columns=POINT_COLUMNS)
+    df["im3_type"] = df["im3_type"].astype(object)
     return df[df["country"].isin(NORTH_AMERICA_COUNTRIES)].reset_index(drop=True)
 
 
@@ -96,10 +102,10 @@ def load_datacenters_kml(path) -> pd.DataFrame:
             "company": html.unescape(company) if company else np.nan,
             "city": np.nan, "state": np.nan, "country": np.nan, "address": np.nan,
             "lat": float(lat), "lon": float(lon),
-            "sqft": np.nan, "status": np.nan,
+            "sqft": np.nan, "status": np.nan, "im3_type": np.nan,
         })
     df = pd.DataFrame(rows, columns=POINT_COLUMNS)
-    text_cols = ["city", "state", "country", "address", "status"]
+    text_cols = ["city", "state", "country", "address", "status", "im3_type"]
     df[text_cols] = df[text_cols].astype(object)
     return df
 
@@ -118,6 +124,7 @@ def load_im3_atlas(path) -> pd.DataFrame:
         "lon": df["lon"],
         "sqft": df["sqft"],
         "status": "existing",
+        "im3_type": df["type"],      # building | campus | point
     }, columns=POINT_COLUMNS)
 
 
@@ -143,9 +150,13 @@ def estimate_mw(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["mw_estimate"] = np.nan
     df["mw_method"] = "unknown"
-    has_sqft = df["sqft"].notna() & (df["sqft"] > 0)
+    excluded = df["im3_type"].isin(IM3_EXCLUDED_TYPES)
+    has_sqft = df["sqft"].notna() & (df["sqft"] > 0) & ~excluded
     df.loc[has_sqft, "mw_estimate"] = df.loc[has_sqft, "sqft"] * W_PER_SQFT / 1_000_000.0
     df.loc[has_sqft, "mw_method"] = "sqft_derived"
+    # campus sqft is acquired land, not floor area -- x150 W/ft2 gave e.g. 2,121 MW
+    # for Meta Huntsville. Keep the point for location, drop the MW.
+    df.loc[excluded, "mw_method"] = "campus_land_area_excluded"
     return df
 
 
@@ -161,83 +172,12 @@ def split_bad_geocodes(df: pd.DataFrame):
 # ----------------------------------------------------------------------------
 # 4. Point-in-polygon joins
 # ----------------------------------------------------------------------------
-def read_polygon_layer(reader: shapefile.Reader, prj_wkt: str | None, fallback_crs: str | None = None):
-    """Returns (records DataFrame, rings, CRS). rings = (ring polygons, owning
-    record index). Rings are kept separate rather than assembled into (often
-    invalid) polygons: a point is inside a record when it falls in an odd number
-    of that record's rings, which handles holes and needs no make_valid pass --
-    too slow on the 16M-vertex StatCan layer."""
-    fields = [f[0] for f in reader.fields[1:]]
-    records, ring_geoms, ring_owner = [], [], []
-    for i, sr in enumerate(reader.iterShapeRecords()):
-        records.append(dict(zip(fields, sr.record)))
-        pts = np.asarray(sr.shape.points)
-        bounds = list(sr.shape.parts) + [len(pts)]
-        for a, b in zip(bounds[:-1], bounds[1:]):
-            if b - a >= 4:
-                ring_geoms.append(shapely.polygons(pts[a:b]))
-                ring_owner.append(i)
-    crs = CRS.from_wkt(prj_wkt) if prj_wkt else CRS.from_user_input(fallback_crs)
-    return pd.DataFrame(records), (ring_geoms, np.asarray(ring_owner)), crs
-
-
-def read_prj(path) -> str | None:
-    try:
-        return path.read_text()
-    except FileNotFoundError:
-        return None
-
-
-def read_prj_from_zip(zip_path) -> str:
-    import zipfile
-    with zipfile.ZipFile(zip_path) as z:
-        name = next(n for n in z.namelist() if n.endswith(".prj"))
-        return z.read(name).decode("latin1")
-
-
-def first_polygon_match(lats, lons, rings, crs) -> np.ndarray:
-    """Index of the first record (in file order) containing each point, or -1."""
-    ring_geoms, ring_owner = rings
-    transformer = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
-    xs, ys = transformer.transform(np.asarray(lons), np.asarray(lats))
-    points = shapely.points(xs, ys)
-    pt_idx, ring_idx = shapely.STRtree(ring_geoms).query(points, predicate="intersects")
-    hits = pd.DataFrame({"pt": pt_idx, "owner": ring_owner[ring_idx]})
-    parity = hits.groupby(["pt", "owner"]).size()
-    inside = parity[parity % 2 == 1].reset_index()
-    first = inside.groupby("pt")["owner"].min()
-    result = np.full(len(points), -1)
-    result[first.index.to_numpy()] = first.to_numpy()
-    return result
-
-
-def load_control_areas():
-    reader = shapefile.Reader(str(CONTROL_AREAS_SHP))
-    prj = read_prj(CONTROL_AREAS_SHP.with_suffix(".prj"))
-    recs, geoms, crs = read_polygon_layer(reader, prj, CONTROL_AREAS_FALLBACK_CRS)
-    for col in ["TOTAL_CAP", "PEAK_LOAD", "MIN_LOAD", "AVAIL_CAP"]:
-        recs[col] = pd.to_numeric(recs[col], errors="coerce").replace(HIFLD_NULL, np.nan)
-    return recs, geoms, crs
-
-
 def spatial_join(df: pd.DataFrame, control_areas) -> pd.DataFrame:
     df = df.copy()
     lats, lons = df["lat"].to_numpy(), df["lon"].to_numpy()
-
-    ba_recs, ba_geoms, ba_crs = control_areas
-    idx = first_polygon_match(lats, lons, ba_geoms, ba_crs)
-    df["ba_name"] = np.where(idx >= 0, ba_recs["NAME"].to_numpy()[idx], None)
-
-    st_recs, st_geoms, st_crs = read_polygon_layer(
-        shapefile.Reader(str(TIGER_STATES_ZIP)), read_prj_from_zip(TIGER_STATES_ZIP))
-    idx = first_polygon_match(lats, lons, st_geoms, st_crs)
-    df["joined_state"] = np.where(idx >= 0, st_recs["NAME"].to_numpy()[idx], None)
-
-    pr_recs, pr_geoms, pr_crs = read_polygon_layer(
-        shapefile.Reader(str(STATCAN_PROVINCES_ZIP), encoding="latin1"),
-        read_prj_from_zip(STATCAN_PROVINCES_ZIP))
-    idx = first_polygon_match(lats, lons, pr_geoms, pr_crs)
-    df["joined_province"] = np.where(idx >= 0, pr_recs["PRENAME"].to_numpy()[idx], None)
+    df["ba_name"] = join_ba(lats, lons, control_areas)
+    df["joined_state"] = join_state(lats, lons)
+    df["joined_province"] = join_province(lats, lons)
     return df
 
 
@@ -255,25 +195,72 @@ def assign_country_from_joins(df: pd.DataFrame) -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 # 5. Spatial dedup
 # ----------------------------------------------------------------------------
-def dedupe_points(df: pd.DataFrame, radius_m: float = DEDUP_RADIUS_M) -> pd.DataFrame:
-    df = df.dropna(subset=["lat", "lon"]).reset_index(drop=True)
-    if df.empty:
-        return df
-    coords_rad = np.radians(df[["lat", "lon"]].to_numpy())
+def _greedy_clusters(coords_deg: np.ndarray, order: np.ndarray, radius_m: float) -> np.ndarray:
+    """Seed-based clustering: walk points in `order`; each unvisited point seeds a
+    cluster of every unvisited point within radius_m of it. Returns the seed
+    index for every point. Deterministic given `order`, and a cluster never
+    spans more than radius_m from its seed (no chaining across a whole campus)."""
+    seed_of = np.full(len(coords_deg), -1)
+    if len(coords_deg) == 0:
+        return seed_of
+    coords_rad = np.radians(coords_deg)
     tree = BallTree(coords_rad, metric="haversine")
     neighbors = tree.query_radius(coords_rad, r=radius_m / EARTH_RADIUS_M)
-    has_mw = (df["mw_method"] != "unknown").to_numpy()
-
-    visited = np.zeros(len(df), dtype=bool)
-    keep = []
-    for i in range(len(df)):
-        if visited[i]:
+    for i in order:
+        if seed_of[i] >= 0:
             continue
-        group = np.sort(neighbors[i])
-        visited[group] = True
-        # prefer a row that already carries an MW estimate
-        keep.append(group[np.argmax(has_mw[group])] if has_mw[group].any() else group[0])
-    return df.iloc[sorted(set(keep))].reset_index(drop=True)
+        group = neighbors[i]
+        group = group[seed_of[group] < 0]
+        seed_of[group] = i
+    return seed_of
+
+
+def _within_radius(coords_deg: np.ndarray, anchors_deg: np.ndarray, radius_m: float) -> np.ndarray:
+    if len(anchors_deg) == 0 or len(coords_deg) == 0:
+        return np.zeros(len(coords_deg), dtype=bool)
+    tree = BallTree(np.radians(anchors_deg), metric="haversine")
+    dist, _ = tree.query(np.radians(coords_deg), k=1)
+    return dist[:, 0] * EARTH_RADIUS_M <= radius_m
+
+
+def dedupe_points(df: pd.DataFrame, radius_m: float = DEDUP_RADIUS_M) -> pd.DataFrame:
+    """
+    1. IM3 buildings with MW: cluster within radius_m (seeded largest-first) and
+       collapse each cluster to one point at the seed, with sqft and MW SUMMED --
+       these are distinct buildings on one campus, not duplicates.
+    2. Every other record (directory, IM3 campus/point) within radius_m of any
+       IM3 building is a cross-source duplicate of it and is dropped.
+    3. The remaining records are deduplicated among themselves, keeping the
+       first in file order (none of them carry MW).
+    `merged_records` counts how many input rows each output row represents.
+    """
+    df = df.dropna(subset=["lat", "lon"]).reset_index(drop=True)
+    is_bldg = (df["source"] == "im3_atlas") & (df["mw_method"] == "sqft_derived")
+    bldg, rest = df[is_bldg].reset_index(drop=True), df[~is_bldg].reset_index(drop=True)
+
+    coords = bldg[["lat", "lon"]].to_numpy()
+    order = np.argsort(-bldg["mw_estimate"].to_numpy(), kind="stable")
+    bldg["_seed"] = _greedy_clusters(coords, order, radius_m)
+    sums = bldg.groupby("_seed").agg(sqft=("sqft", "sum"), mw_estimate=("mw_estimate", "sum"),
+                                     merged_records=("name", "size"))
+    merged = bldg.loc[sums.index].copy()
+    merged["sqft"] = sums["sqft"].to_numpy()
+    merged["mw_estimate"] = sums["mw_estimate"].to_numpy()
+    merged["merged_records"] = sums["merged_records"].to_numpy()
+
+    overlaps = _within_radius(rest[["lat", "lon"]].to_numpy(), coords, radius_m)
+    rest = rest[~overlaps].reset_index(drop=True)
+    rest_seed = _greedy_clusters(rest[["lat", "lon"]].to_numpy(), np.arange(len(rest)), radius_m)
+    counts = pd.Series(rest_seed).value_counts().sort_index()
+    rest = rest.loc[counts.index].copy()
+    rest["merged_records"] = counts.to_numpy()
+
+    out = pd.concat([merged.drop(columns="_seed"), rest], ignore_index=True)
+    out["merged_records"] = out["merged_records"].astype(int)
+    print(f"  IM3 buildings: {len(bldg)} -> {len(merged)} campus points (MW summed); "
+          f"{int(overlaps.sum())} cross-source duplicates dropped; "
+          f"{len(rest)} directory/campus-only points kept")
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -281,8 +268,9 @@ def dedupe_points(df: pd.DataFrame, radius_m: float = DEDUP_RADIUS_M) -> pd.Data
 # ----------------------------------------------------------------------------
 def databricks_state_totals() -> pd.DataFrame:
     db = pd.read_csv(DATABRICKS_CSV)
+    db["STATE_NAME"] = db["STATE_NAME"].str.replace(" Of ", " of ")   # match TIGER's "District of Columbia"
     total = db.groupby("STATE_NAME")["TOT_POWER_MW"].sum(min_count=1).rename("databricks_mw_total")
-    active = (db[db["DATACENTER_STAGE"] == "Active"]
+    active = (db[db["DATACENTER_STAGE"].isin(DATABRICKS_BASELINE_STAGES)]
               .groupby("STATE_NAME")["TOT_POWER_MW"].sum(min_count=1)
               .rename("databricks_active_mw"))
     out = pd.concat([total, active], axis=1).reset_index().rename(columns={"STATE_NAME": "state"})
@@ -297,28 +285,28 @@ def qa_against_databricks(points: pd.DataFrame, db_totals: pd.DataFrame) -> pd.D
     )
     qa = db_totals.merge(point_totals, on="state", how="left")
     qa["point_layer_mw_total"] = qa["point_layer_mw_total"].fillna(0.0)
-    qa["gap_mw"] = qa["databricks_mw_total"] - qa["point_layer_mw_total"]
+    qa["databricks_active_mw"] = qa["databricks_active_mw"].fillna(0.0)
+    qa["gap_mw"] = qa["databricks_active_mw"] - qa["point_layer_mw_total"]
     qa["pct_of_known_total_captured"] = np.where(
-        qa["databricks_mw_total"] > 0,
-        100.0 * qa["point_layer_mw_total"] / qa["databricks_mw_total"], np.nan)
-    cols = ["state", "databricks_mw_total", "point_layer_mw_total", "gap_mw",
-            "pct_of_known_total_captured", "databricks_active_mw"]
+        qa["databricks_active_mw"] > 0,
+        100.0 * qa["point_layer_mw_total"] / qa["databricks_active_mw"], np.nan)
+    cols = ["state", "databricks_active_mw", "point_layer_mw_total", "gap_mw",
+            "pct_of_known_total_captured", "databricks_mw_total"]
     return qa[cols].sort_values("gap_mw", ascending=False).reset_index(drop=True)
 
 
 def adjusted_baseline(qa: pd.DataFrame) -> pd.DataFrame:
-    adj = qa[["state", "point_layer_mw_total", "databricks_mw_total"]].copy()
-    adj["databricks_mw_total"] = adj["databricks_mw_total"].fillna(0.0)
-    use_db = adj["databricks_mw_total"] > adj["point_layer_mw_total"]
-    adj["adjusted_baseline_mw"] = np.where(use_db, adj["databricks_mw_total"], adj["point_layer_mw_total"])
-    adj["source_used"] = np.where(use_db, "databricks_state_total", "point_layer_sum")
+    adj = qa[["state", "point_layer_mw_total", "databricks_active_mw"]].copy()
+    use_db = adj["databricks_active_mw"] > adj["point_layer_mw_total"]
+    adj["adjusted_baseline_mw"] = np.where(use_db, adj["databricks_active_mw"], adj["point_layer_mw_total"])
+    adj["source_used"] = np.where(use_db, "databricks_active_total", "point_layer_sum")
     adj["scale_factor"] = np.where(
         adj["point_layer_mw_total"] > 0,
         adj["adjusted_baseline_mw"] / adj["point_layer_mw_total"], np.nan)
     # with no point MW in the state there is nothing to scale up, so the databricks
     # total can't be placed on the map -- flag it rather than silently dropping it
     unplaceable = use_db & (adj["point_layer_mw_total"] <= 0)
-    adj.loc[unplaceable, "source_used"] = "databricks_state_total_unplaceable"
+    adj.loc[unplaceable, "source_used"] = "databricks_active_total_unplaceable"
     return adj.sort_values("adjusted_baseline_mw", ascending=False).reset_index(drop=True)
 
 
@@ -335,7 +323,7 @@ def ba_stress_index(points: pd.DataFrame, adj: pd.DataFrame, ba_recs: pd.DataFra
         point_mw_sum=("mw_estimate", lambda s: s.fillna(0.0).sum()),
         scaled_dc_load_mw=("scaled_mw", "sum"),
         facility_count=("name", "size"),
-        unknown_mw_count=("mw_method", lambda s: (s == "unknown").sum()),
+        unknown_mw_count=("mw_method", lambda s: (s != "sqft_derived").sum()),
         states_touched=("joined_state", "nunique"),
     ).reset_index()
 
@@ -451,7 +439,7 @@ def main():
     points = dedupe_points(combined)
     print(f"  -> {before} records reduced to {len(points)}")
 
-    base_cols = POINT_COLUMNS + ["mw_estimate", "mw_method"]
+    base_cols = POINT_COLUMNS + ["mw_estimate", "mw_method", "merged_records"]
     points[base_cols].to_csv(OUT_DIR / "harmonized_existing_dc.csv", index=False)
     write_points_geojson(points[base_cols], OUT_DIR / "harmonized_existing_dc.geojson")
     points.to_csv(OUT_DIR / "harmonized_existing_dc_with_ba.csv", index=False)

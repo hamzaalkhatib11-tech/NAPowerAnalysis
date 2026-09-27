@@ -15,6 +15,7 @@ STEPS = [
     "harmonize_datacenters.py",
     "canada_footprint_mw.py",
     "canada_stress.py",
+    "us_time_series.py",
     "verify_outputs.py",
 ]
 

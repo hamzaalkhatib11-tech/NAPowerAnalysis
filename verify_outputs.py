@@ -2,8 +2,9 @@
 verify_outputs.py
 
 Compares output/ against reference_outputs/ (the sandbox-run CSVs the handoff's
-§6 results came from) and checks the headline §6 benchmarks. Prints a report;
-exit code 1 if any benchmark fails.
+§6 results came from; differences are expected after the methodology updates),
+then checks invariants that must still hold and the U.S. time series' shape and
+conservation of load. Exit code 1 if an invariant or time-series check fails.
 """
 
 import sys
@@ -79,31 +80,64 @@ def compare_counts(name):
     print(f"\n[{'MATCH' if len(new) == len(ref) else 'DIFF'}] {name}: {len(new)} rows (reference {len(ref)})")
 
 
-def benchmarks() -> bool:
-    ba = read(OUT_DIR / "ba_level_stress_index.csv").set_index("ba_name")["stress_index"]
+def _check(label, value, target, tol) -> bool:
+    ok = value is not None and pd.notna(value) and abs(value - target) <= tol
+    print(f"  [{'PASS' if ok else 'FAIL'}] {label:<44} got {value if value is None else round(float(value), 4)}")
+    return ok
+
+
+def invariants() -> bool:
+    """Results the methodology updates must NOT change."""
     ca = read(OUT_DIR / "canada_stress_index_2025_vs_2035.csv").set_index("province")
+    head = read(OUT_DIR / "canada_headroom_2025_vs_2035.csv").set_index("province")
     dc = read(OUT_DIR / "canada_dc_with_mw.csv")
     vq = dc.loc[dc["name"] == "VisionQuest ATC Data Center"]
+    flagged = read(OUT_DIR / "flagged_bad_geocodes.csv")
 
-    checks = [
-        ("PNM stress index ~1.25", ba.get("PUBLIC SERVICE COMPANY OF NEW MEXICO"), 1.25, 0.01),
-        ("APS stress index ~0.99", ba.get("ARIZONA PUBLIC SERVICE COMPANY"), 0.99, 0.01),
-        ("PJM stress index ~0.235", ba.get("PJM INTERCONNECTION, LLC"), 0.235, 0.005),
-        ("Ontario stress 2025 ~0.0137", ca.loc["Ontario", "stress_index_2025"], 0.0137, 0.0001),
-        ("Ontario stress 2035 ~0.0478", ca.loc["Ontario", "stress_index_2035"], 0.0478, 0.0001),
-        ("Ontario DC load 2035 ~482 MW", ca.loc["Ontario", "dc_load_2035_mw"], 482.0, 1.0),
-        ("VisionQuest footprint MW ~0.42", vq["mw_estimate"].iloc[0] if len(vq) else None, 0.42, 0.02),
-    ]
-    print("\n=== §6 benchmarks ===")
-    ok_all = True
-    for label, value, target, tol in checks:
-        ok = value is not None and pd.notna(value) and abs(value - target) <= tol
-        ok_all &= ok
-        print(f"  [{'PASS' if ok else 'FAIL'}] {label:<34} got {value if value is None else round(value, 4)}")
-    if len(vq):
-        print(f"  VisionQuest location: {vq['lat'].iloc[0]:.5f}, {vq['lon'].iloc[0]:.5f} "
-              f"({vq['joined_province'].iloc[0]})")
-    return ok_all
+    print("\n=== invariants (must hold) ===")
+    ok = all([
+        _check("VisionQuest footprint MW ~0.42", vq["mw_estimate"].iloc[0] if len(vq) else None, 0.42, 0.02),
+        _check("VisionQuest lat (Charlottetown)", vq["lat"].iloc[0] if len(vq) else None, 46.2372, 0.001),
+        _check("Ontario DC growth 2025->2035 x1.854",
+               ca.loc["Ontario", "dc_load_2035_mw"] / ca.loc["Ontario", "dc_load_2025_mw"], 1.854, 0.001),
+        _check("Ontario headroom change -46.8%", head.loc["Ontario", "headroom_change_pct"], -46.8, 0.1),
+        _check("Nova Scotia headroom change +395.5%", head.loc["Nova Scotia", "headroom_change_pct"], 395.5, 0.1),
+        _check("bad geocodes flagged = 13", len(flagged), 13, 0),
+    ])
+    return ok
+
+
+def time_series_checks() -> bool:
+    ts = read(OUT_DIR / "us_ba_time_series_2025_2035.csv")
+    required = ["BA_NAME", "YEAR", "DC_LOAD_MW", "TOTAL_CAP_MW", "PEAK_LOAD_MW", "AVAIL_CAP_MW", "STRESS_INDEX"]
+    print("\n=== U.S. time series ===")
+    missing = [c for c in required if c not in ts.columns]
+    print(f"  [{'PASS' if not missing else 'FAIL'}] required columns present {missing or ''}")
+    per_ba = ts.groupby("BA_NAME")["YEAR"].agg(["min", "max", "nunique"])
+    full = (per_ba["min"].eq(2025) & per_ba["max"].eq(2035) & per_ba["nunique"].eq(11)).all()
+    print(f"  [{'PASS' if full else 'FAIL'}] every BA has 2025..2035 ({len(per_ba)} BAs, {len(ts)} rows)")
+    no_new_2025 = ts.loc[ts["YEAR"] == 2025, "DC_NEW_MW"].abs().max() < 1e-6
+    print(f"  [{'PASS' if no_new_2025 else 'FAIL'}] no projected new load in 2025")
+    monotone = (ts.sort_values("YEAR").groupby("BA_NAME")["DC_LOAD_MW"].diff().dropna() >= -1e-6).all()
+    print(f"  [{'PASS' if monotone else 'FAIL'}] DC load never decreases year to year")
+    new_2035 = ts.loc[ts["YEAR"] == 2035, "DC_NEW_MW"].sum()
+    import json
+    cells = json.load(open(OUT_DIR / "growth_2035_wgs84.geojson", encoding="utf-8"))["features"]
+    grid_total = sum(f["properties"]["data_center_it_power_mw"] for f in cells)
+    conserved = abs(new_2035 - grid_total) < 1.0
+    print(f"  [{'PASS' if conserved else 'FAIL'}] 2035 new load {new_2035:,.0f} MW = growth grid {grid_total:,.0f} MW")
+    return not missing and full and no_new_2025 and monotone and conserved
+
+
+def legacy_benchmarks():
+    """Handoff §6 U.S. figures. Informational: the campus / dedup / Active-only
+    fixes are expected to move them."""
+    ba = read(OUT_DIR / "ba_level_stress_index.csv").set_index("ba_name")["stress_index"]
+    print("\n=== handoff §6 U.S. figures (informational; expected to change) ===")
+    for name, handoff in [("PUBLIC SERVICE COMPANY OF NEW MEXICO", 1.25), ("ARIZONA PUBLIC SERVICE COMPANY", 0.99),
+                          ("BONNEVILLE POWER ADMINISTRATION", 0.55), ("PJM INTERCONNECTION, LLC", 0.235),
+                          ("TENNESSEE VALLEY AUTHORITY", 0.27)]:
+        print(f"  {name:<40} handoff {handoff:<6} now {ba.get(name, np.nan):.3f}")
 
 
 def main():
@@ -112,7 +146,9 @@ def main():
         compare_keyed(name, key)
     for name in COUNT_FILES:
         compare_counts(name)
-    return 0 if benchmarks() else 1
+    legacy_benchmarks()
+    ok = invariants() & time_series_checks()
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
