@@ -1,0 +1,17 @@
+# Raw inputs are large and re-downloadable; see PROJECT_HANDOFF.md §3 for sources.
+data/
+*.zip
+part-*.gz
+*.csv.gz
+
+# Pipeline outputs are rebuilt by run_pipeline.py.
+output/
+
+# Python / tooling
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.ipynb_checkpoints/
+*.tmp
+~$*

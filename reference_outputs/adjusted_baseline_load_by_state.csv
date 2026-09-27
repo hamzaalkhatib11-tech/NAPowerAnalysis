@@ -1,0 +1,49 @@
+state,point_layer_mw_total,databricks_mw_total,adjusted_baseline_mw,source_used
+Virginia,9844.76865,24835.714,24835.714,databricks_state_total
+Texas,1739.51145,8739.99845,8739.99845,databricks_state_total
+Tennessee,7013.6979,245.39515,7013.6979,point_layer_sum
+Oregon,6998.5503,2291.3041,6998.5503,point_layer_sum
+Arizona,1687.26075,6851.18075,6851.18075,databricks_state_total
+Iowa,6384.83205,1760.1678,6384.83205,point_layer_sum
+Nebraska,5674.2705000000005,1125.1453,5674.2705000000005,point_layer_sum
+Ohio,3576.13785,5575.33745,5575.33745,databricks_state_total
+Georgia,3102.0405,5478.97745,5478.97745,databricks_state_total
+Illinois,1325.35725,3979.08945,3979.08945,databricks_state_total
+Nevada,756.42705,3795.0454,3795.0454,databricks_state_total
+Utah,3719.655,1036.7052,3719.655,point_layer_sum
+New Mexico,3691.97385,289.3967,3691.97385,point_layer_sum
+California,737.1402,2954.304,2954.304,databricks_state_total
+Washington,2827.95825,1353.3575,2827.95825,point_layer_sum
+Louisiana,0.0,2185.17685,2185.17685,databricks_state_total
+South Carolina,2024.2656,680.7930000000001,2024.2656,point_layer_sum
+Indiana,31.5453,1861.9543,1861.9543,databricks_state_total
+Alabama,1849.5765000000001,294.40005,1849.5765000000001,point_layer_sum
+North Carolina,1726.37115,1325.8939500000001,1726.37115,point_layer_sum
+Missouri,182.6637,1588.22565,1588.22565,databricks_state_total
+Wyoming,1399.5963,269.07890000000003,1399.5963,point_layer_sum
+Mississippi,246.36465,1310.8094,1310.8094,databricks_state_total
+Pennsylvania,86.35005,1175.6645,1175.6645,databricks_state_total
+Connecticut,41.58795,1013.5032,1013.5032,databricks_state_total
+New Jersey,820.0446,632.1972000000001,820.0446,point_layer_sum
+Wisconsin,15.04275,789.7229,789.7229,databricks_state_total
+Colorado,208.6332,491.6274,491.6274,databricks_state_total
+Minnesota,61.99935,455.9286,455.9286,databricks_state_total
+Maryland,68.82375,304.32590000000005,304.32590000000005,databricks_state_total
+Oklahoma,63.5124,297.1017,297.1017,databricks_state_total
+New York,51.47985,281.0241,281.0241,databricks_state_total
+Michigan,33.5724,207.4952,207.4952,databricks_state_total
+Florida,81.77865,192.28945,192.28945,databricks_state_total
+Massachusetts,27.7971,171.53895,171.53895,databricks_state_total
+Idaho,3.3525,118.0041,118.0041,databricks_state_total
+North Dakota,0.0,100.0,100.0,databricks_state_total
+Kentucky,77.0613,23.762949999999996,77.0613,point_layer_sum
+Kansas,73.1439,30.4518,73.1439,point_layer_sum
+Delaware,0.0,17.4699,17.4699,databricks_state_total
+South Dakota,8.39445,3.599899999999999,8.39445,point_layer_sum
+Maine,8.30745,,8.30745,point_layer_sum
+Hawaii,0.0,6.382999999999995,6.382999999999995,databricks_state_total
+New Hampshire,5.742900000000001,1.4412999999999994,5.742900000000001,point_layer_sum
+Arkansas,5.46375,4.0992999999999995,5.46375,point_layer_sum
+District Of Columbia,0.0,4.822800000000002,4.822800000000002,databricks_state_total
+Rhode Island,0.0,2.25,2.25,databricks_state_total
+Vermont,0.0,,0.0,point_layer_sum

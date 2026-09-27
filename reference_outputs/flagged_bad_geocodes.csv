@@ -1,0 +1,14 @@
+source,name,company,city,state,country,address,lat,lon,sqft,status,mw_estimate,mw_method
+datacenters_geojson,565 Metro Place South,Metro Datacenter,States,,United States,565 Metro Place South Dublin United States,53.3498,-6.2603,,,,unknown
+datacenters_geojson,Birmingham,DC Blox,Birmingham,Alabama,United States,1 Golden Flake Dr 35205-3312 Birmingham USA,52.4862,-1.8904,,,,unknown
+datacenters_geojson,Birmingham (North 20th Street),CenturyLink,Birmingham,Alabama,United States,505 20th St N 35203 Birmingham United States,52.4862,-1.8904,,,,unknown
+datacenters_geojson,Columbus Dublin,Expedient,Dublin,Ohio,United States,5700 Innovation Dr 43016-3271 Dublin USA,53.3498,-6.2603,,,,unknown
+datacenters_geojson,Creative Network Innovations,Creative Network Innovations (CNI),Melbourne,Florida,United States,"6905 N Wickham Rd., Ste 300 32935 Melbourne United States",37.8136,144.9631,,,,unknown
+datacenters_geojson,Detroit,Quicken Loans,Rosa,,United States,1401 Rosa Parks Corktown United States,51.8985,-8.4756,,,,unknown
+datacenters_geojson,Dublin,Amazon,States,,United States,Houchard Rd Dublin United States,53.3498,-6.2603,,,,unknown
+datacenters_geojson,IPR Reading BCC,IPR International,Reading,Pennsylvania,United States,Bernville Road 19605 Reading United States,51.4543,-0.9781,,,,unknown
+datacenters_geojson,Manchester,"FairPoint Communications, Inc.",States,,United States,tbc Manchester United States,53.4808,-2.2426,,,,unknown
+datacenters_geojson,Manchester (Sundial Avenue),FirstLight,Manchester,New Hampshire,United States,1 Sundial Ave 03103 Manchester USA,53.4808,-2.2426,,,,unknown
+datacenters_geojson,Providence,Crown Castle,Providence,,United States,235 Promenade 2909 Providence United States,41.9028,12.4964,,,,unknown
+datacenters_geojson,Spectra Access Data Center,Spectra Access,Manchester,New Hampshire,United States,27 Lowell Street 03101 Manchester United States,53.4808,-2.2426,,,,unknown
+datacenters_geojson,The Pyramid Campus,Switch,Caledonia,Michigan,United States,6100 E Paris Ave SE 49316-9790 Caledonia USA,48.8566,2.3522,,,,unknown
