@@ -23,17 +23,28 @@ Supply
   - units retired after the HIFLD year (Retired sheet)
   - operating units with a planned retirement year from 2026 on
   Capacity is EIA net summer MW, not derated for solar/wind availability.
-  PEAK_LOAD grows at NON_DC_PEAK_GROWTH from the HIFLD year.
 
-Stress
-  AVAIL_CAP = TOTAL_CAP - PEAK_LOAD  (headroom; same basis as canada_stress.py)
-  STRESS_INDEX = DC_LOAD / AVAIL_CAP when AVAIL_CAP > 0, else null with
-  STRESS_CLASS = "no_headroom".
+Peak
+  System peak = EIA-930 2025 hourly peak (adjusted demand, spike-filtered)
+  where the EIA-930 BA footprint matches HIFLD's (PEAK_SCOPE_RATIO); otherwise
+  HIFLD's own peak. PEAK_LOAD_MW is the *baseline (non-data-centre)* peak:
+  system peak - existing DC load, grown at NON_DC_PEAK_GROWTH. Subtracting the
+  existing DC load keeps it from being counted twice (numerator + peak).
+
+Stress (PROJECT_HANDOFF.md §2)
+  AVAIL_CAP = TOTAL_CAP - PEAK_LOAD  (headroom left for data centres)
+  STRESS_INDEX = DC_LOAD / AVAIL_CAP, so STRESS_INDEX > 1 exactly when
+  capacity can't cover the system peak (baseline + DC). Null with
+  STRESS_CLASS = "no_headroom" when AVAIL_CAP <= 0.
+  DATA_ARTIFACT_FLAG marks BAs whose values reflect data definitions rather
+  than grid conditions (config.DATA_ARTIFACT_BAS + HIFLD capacity below the
+  BA's own 2025 peak); STRESS_CLASS = "data_artifact" for those.
 
 Writes to output/:
   us_ba_time_series_2025_2035.csv      master table (one row per BA per year)
   us_ba_capacity_changes.csv           per-BA roll-forward detail, for QA
   us_generator_ba_qa.csv               EIA operating MW vs HIFLD TOTAL_CAP per BA
+  us_ba_peak_2025.csv                  EIA-930 vs HIFLD peak per BA and which was used
 """
 
 import json
@@ -44,8 +55,9 @@ import shapely
 from shapely.geometry import shape as shapely_shape
 
 from config import (
-    EIA860M_XLSX, EIA_BA_CODE_TO_HIFLD, EIA_CAPACITY_COLUMN, EIA_PLANNED_STATUSES, GROWTH_PUE,
-    GROWTH_SCENARIO_ANNUAL_RATE, NON_DC_PEAK_GROWTH, OUT_DIR, TS_YEARS,
+    DATA_ARTIFACT_BAS, EIA860M_XLSX, EIA930_FILES, EIA_BA_CODE_TO_HIFLD, EIA_CAPACITY_COLUMN,
+    EIA_PLANNED_STATUSES, GROWTH_PUE, GROWTH_SCENARIO_ANNUAL_RATE, NON_DC_PEAK_GROWTH, OUT_DIR,
+    PEAK_SCOPE_RATIO, PEAK_SPIKE_FACTOR, TS_YEARS,
 )
 from geo import join_ba, load_control_areas
 
@@ -150,11 +162,70 @@ def generator_qa(sheets: dict, bas: pd.DataFrame) -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------------
+# Peak
+# ----------------------------------------------------------------------------
+def eia930_peaks() -> pd.DataFrame:
+    """2025 hourly peak per EIA BA code from EIA-930 adjusted demand."""
+    col = "Demand (MW) (Adjusted)"
+    demand = pd.concat([pd.read_csv(f, usecols=["Balancing Authority", col], thousands=",")
+                        for f in EIA930_FILES])
+    out = []
+    for code, s_ in demand.groupby("Balancing Authority")[col]:
+        s_ = s_.dropna()
+        if s_.empty:
+            continue
+        p999 = s_.quantile(0.999)
+        kept = s_[s_ <= PEAK_SPIKE_FACTOR * p999]
+        out.append({"eia_code": code, "eia930_peak_2025_mw": kept.max(),
+                    "spike_hours_dropped": int(len(s_) - len(kept))})
+    return pd.DataFrame(out)
+
+
+def system_peaks(bas: pd.DataFrame, base_year: pd.Series) -> pd.DataFrame:
+    """Per HIFLD BA: the system peak used, its year and source."""
+    eia = eia930_peaks()
+    eia["ba_name"] = eia["eia_code"].map(EIA_BA_CODE_TO_HIFLD)
+    eia = eia.dropna(subset=["ba_name"]).groupby("ba_name").agg(
+        eia930_peak_2025_mw=("eia930_peak_2025_mw", "sum"),
+        spike_hours_dropped=("spike_hours_dropped", "sum"))
+    peaks = pd.DataFrame({"hifld_peak_mw": bas["PEAK_LOAD"], "hifld_year": base_year}).join(eia)
+    ratio = peaks["eia930_peak_2025_mw"] / peaks["hifld_peak_mw"]
+    lo, hi = PEAK_SCOPE_RATIO
+    use_930 = ratio.between(lo, hi)
+    peaks["ratio_930_to_hifld"] = ratio
+    peaks["system_peak_mw"] = np.where(use_930, peaks["eia930_peak_2025_mw"], peaks["hifld_peak_mw"])
+    peaks["peak_year"] = np.where(use_930, 2025, peaks["hifld_year"])
+    peaks["peak_source"] = np.select(
+        [use_930, peaks["eia930_peak_2025_mw"].notna()],
+        ["EIA-930 2025", "HIFLD (EIA-930 footprint differs)"], "HIFLD (not in EIA-930)")
+    return peaks
+
+
+def artifact_reasons(bas: pd.DataFrame, peaks: pd.DataFrame, changes: pd.DataFrame) -> dict:
+    """config.DATA_ARTIFACT_BAS plus any BA whose rolled-forward 2025 capacity is
+    below its own 2025 system peak -- the lights stayed on, so that capacity
+    figure can't describe the whole system."""
+    reasons = dict(DATA_ARTIFACT_BAS)
+    c25 = changes[changes["year"] == FIRST_YEAR].set_index("ba_name")
+    for ba in bas.index:
+        base_cap, peak = bas.loc[ba, "TOTAL_CAP"], peaks.loc[ba, "system_peak_mw"]
+        if ba in reasons or pd.isna(base_cap) or base_cap <= 0 or pd.isna(peak):
+            continue
+        cap25 = base_cap + c25.loc[ba, "cap_added_mw"] - c25.loc[ba, "cap_retired_mw"]
+        if cap25 < peak:
+            reasons[ba] = (f"2025 capacity ({cap25:,.0f} MW, HIFLD rolled forward) is below "
+                           f"the BA's own 2025 peak ({peak:,.0f} MW)")
+    return reasons
+
+
+# ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
-def classify(stress: float, avail: float, has_cap: bool) -> str:
+def classify(stress: float, avail: float, has_cap: bool, artifact: bool) -> str:
     if not has_cap:
         return "no_capacity_data"
+    if artifact:
+        return "data_artifact"
     if avail <= 0:
         return "no_headroom"
     if stress > 1.0:
@@ -175,29 +246,37 @@ def main():
     existing = existing_load_by_ba()
     new_2035, cells = new_load_by_ba(control_areas)
     print(f"  existing 2025 load: {existing.reindex(bas.index).sum():,.0f} MW; "
-          f"new by 2035: {new_2035.sum():,.0f} MW across {new_2035.size} BAs")
+          f"new by 2035: {new_2035.sum():,.0f} MW (IT x PUE {GROWTH_PUE}) across {new_2035.size} BAs")
+
+    print("Peak ...")
+    peaks = system_peaks(bas, base_year)
+    peaks.to_csv(OUT_DIR / "us_ba_peak_2025.csv", index_label="ba_name")
+    print("  " + ", ".join(f"{k}: {v}" for k, v in peaks["peak_source"].value_counts().items()))
 
     print("Supply ...")
     sheets = load_generators()
     changes = capacity_changes(sheets, base_year)
     changes.to_csv(OUT_DIR / "us_ba_capacity_changes.csv", index=False)
     generator_qa(sheets, bas).to_csv(OUT_DIR / "us_generator_ba_qa.csv", index=False)
+    artifacts = artifact_reasons(bas, peaks, changes)
 
     rows = []
     for _, ch in changes.iterrows():
         ba, year = ch["ba_name"], ch["year"]
-        rec = bas.loc[ba]
-        has_cap = pd.notna(rec["TOTAL_CAP"]) and rec["TOTAL_CAP"] > 0 and pd.notna(rec["PEAK_LOAD"])
+        rec, pk = bas.loc[ba], peaks.loc[ba]
+        has_cap = pd.notna(rec["TOTAL_CAP"]) and rec["TOTAL_CAP"] > 0 and pd.notna(pk["system_peak_mw"])
         dc_existing = float(existing.get(ba, 0.0))
         dc_new = float(new_2035.get(ba, 0.0)) * ramp(year)
         dc = dc_existing + dc_new
         if has_cap:
             cap = rec["TOTAL_CAP"] + ch["cap_added_mw"] - ch["cap_retired_mw"]
-            peak = rec["PEAK_LOAD"] * (1 + NON_DC_PEAK_GROWTH) ** (year - base_year[ba])
+            baseline = max(pk["system_peak_mw"] - dc_existing, 0.0)
+            peak = baseline * (1 + NON_DC_PEAK_GROWTH) ** max(0, year - pk["peak_year"])
             avail = cap - peak
             stress = dc / avail if avail > 0 else np.nan
         else:
             cap = peak = avail = stress = np.nan
+        artifact = ba in artifacts
         rows.append({
             "BA_NAME": ba,
             "BA_ID": rec["ID"],
@@ -208,7 +287,11 @@ def main():
             "PEAK_LOAD_MW": peak,
             "AVAIL_CAP_MW": avail,
             "STRESS_INDEX": stress,
-            "STRESS_CLASS": classify(stress, avail, has_cap),
+            "STRESS_CLASS": classify(stress, avail, has_cap, artifact),
+            "DATA_ARTIFACT_FLAG": artifact,
+            "ARTIFACT_REASON": artifacts.get(ba, ""),
+            "SYSTEM_PEAK_MW": peak + dc if has_cap else np.nan,
+            "PEAK_SOURCE": pk["peak_source"],
             "DC_EXISTING_MW": dc_existing,
             "DC_NEW_MW": dc_new,
             "CAP_ADDED_MW": ch["cap_added_mw"],
@@ -217,15 +300,15 @@ def main():
     ts = pd.DataFrame(rows)
     ts.to_csv(OUT_DIR / "us_ba_time_series_2025_2035.csv", index=False, float_format="%.4f")
     print(f"Wrote us_ba_time_series_2025_2035.csv: {len(ts)} rows ({ts['BA_NAME'].nunique()} BAs x {len(TS_YEARS)} years)")
+    print(f"Data-artifact BAs: {sorted(artifacts)}")
 
+    valid = ts[~ts["DATA_ARTIFACT_FLAG"]]
     for year in (FIRST_YEAR, LAST_YEAR):
-        top = (ts[ts["YEAR"] == year].sort_values("STRESS_INDEX", ascending=False).head(10)
+        top = (valid[valid["YEAR"] == year].sort_values("STRESS_INDEX", ascending=False).head(10)
                [["BA_NAME", "DC_LOAD_MW", "AVAIL_CAP_MW", "STRESS_INDEX"]])
-        print(f"\nTop 10 BAs by stress index, {year}:")
+        print(f"\nTop 10 BAs by stress index, {year} (artifacts excluded):")
         print(top.to_string(index=False, float_format=lambda v: f"{v:,.3f}"))
-    no_head = ts[(ts["YEAR"] == LAST_YEAR) & (ts["STRESS_CLASS"] == "no_headroom")]["BA_NAME"].tolist()
-    if no_head:
-        print(f"\nNo headroom in {LAST_YEAR} (capacity <= peak): {no_head}")
+    print("\n2035 classes:", valid[valid["YEAR"] == LAST_YEAR]["STRESS_CLASS"].value_counts().to_dict())
 
 
 if __name__ == "__main__":

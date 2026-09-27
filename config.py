@@ -105,11 +105,38 @@ TS_YEARS = range(2025, 2036)
 # scenario: 10%/yr data-centre demand growth. The same rate shapes the
 # 2025->2035 ramp so the in-between years follow the scenario's own curve.
 GROWTH_SCENARIO_ANNUAL_RATE = 0.10
-# IM3 gives IT power; grid draw = IT x PUE. 1.0 keeps the published IT figure.
-GROWTH_PUE = 1.0                # <-- REVIEW
-# Growth in non-data-centre peak demand. No BA-level source is in hand, so peaks
-# stay at their HIFLD values; this understates stress where load is growing.
+# IM3 gives IT power; grid draw = IT x PUE (cooling and power-conversion
+# overhead). 1.2 is typical of new hyperscale builds. The existing 2025 layer is
+# already whole-facility (W/ft2 of building area), so PUE applies to new sites only.
+GROWTH_PUE = 1.20
+# Annual growth of the non-data-centre baseline peak after the peak's base year
+# (2025 where EIA-930 is used). 0 = held flat at the observed 2025 level.
 NON_DC_PEAK_GROWTH = 0.0        # <-- REVIEW
+
+# EIA-930 hourly demand, 2025. Peak = max of EIA's "Demand (MW) (Adjusted)"
+# after dropping residual spikes above PEAK_SPIKE_FACTOR x the 99.9th percentile.
+EIA930_FILES = [DATA_DIR / "EIA930_BALANCE_2025_Jan_Jun.csv", DATA_DIR / "EIA930_BALANCE_2025_Jul_Dec.csv"]
+PEAK_SPIKE_FACTOR = 1.2
+# EIA-930 BA footprints don't always match HIFLD's. If the 2025 EIA-930 peak is
+# outside this ratio of HIFLD's own peak, the two datasets describe different
+# systems (e.g. WALC 1,995 vs 159 MW) and pairing a 930 peak with HIFLD
+# capacity would invent a gap, so the HIFLD peak is kept.
+PEAK_SCOPE_RATIO = (0.7, 1.5)
+
+# BAs whose stress values are data-quality artifacts, not findings. Kept in the
+# outputs with DATA_ARTIFACT_FLAG = True so maps can grey them out. BAs whose
+# HIFLD capacity is below their own 2025 system peak are flagged automatically
+# too (the lights stayed on, so that capacity figure can't be the whole system).
+DATA_ARTIFACT_BAS = {
+    "DUKE ENERGY FLORIDA INC": "HIFLD TOTAL_CAP (9.8 GW) is well below EIA-860M plant capacity "
+                               "in the BA (14.7 GW), so its headroom is understated",
+    "IMPERIAL IRRIGATION DISTRICT": "HIFLD TOTAL_CAP (727 MW) is below the BA's own peak "
+                                    "(~1.1 GW); no headroom even in 2025",
+}
+
+# GIS export (export_gis.py)
+GIS_DIR = OUT_DIR / "gis"
+GIS_SIMPLIFY_M = 500.0          # polygon simplification tolerance (Web Mercator metres)
 # EIA-860M capacity measure and which planned projects count as coming online.
 EIA_CAPACITY_COLUMN = "Net Summer Capacity (MW)"
 # (T) approved, (U) <=50% built, (V) >50% built, (TS) built, not yet operating.

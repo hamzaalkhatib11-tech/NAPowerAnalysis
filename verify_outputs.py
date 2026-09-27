@@ -12,7 +12,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-from config import OUT_DIR, REFERENCE_DIR
+from config import DATA_ARTIFACT_BAS, GIS_DIR, GROWTH_PUE, OUT_DIR, REFERENCE_DIR
 
 # file -> key column(s) used to align rows
 KEYED_FILES = {
@@ -123,10 +123,22 @@ def time_series_checks() -> bool:
     new_2035 = ts.loc[ts["YEAR"] == 2035, "DC_NEW_MW"].sum()
     import json
     cells = json.load(open(OUT_DIR / "growth_2035_wgs84.geojson", encoding="utf-8"))["features"]
-    grid_total = sum(f["properties"]["data_center_it_power_mw"] for f in cells)
+    grid_total = sum(f["properties"]["data_center_it_power_mw"] for f in cells) * GROWTH_PUE
     conserved = abs(new_2035 - grid_total) < 1.0
-    print(f"  [{'PASS' if conserved else 'FAIL'}] 2035 new load {new_2035:,.0f} MW = growth grid {grid_total:,.0f} MW")
-    return not missing and full and no_new_2025 and monotone and conserved
+    print(f"  [{'PASS' if conserved else 'FAIL'}] 2035 new load {new_2035:,.0f} MW = growth grid x PUE {grid_total:,.0f} MW")
+    flagged = set(ts.loc[ts["DATA_ARTIFACT_FLAG"], "BA_NAME"])
+    artifacts_ok = set(DATA_ARTIFACT_BAS) <= flagged
+    print(f"  [{'PASS' if artifacts_ok else 'FAIL'}] configured artifact BAs flagged ({len(flagged)} flagged in total)")
+
+    ca = read(OUT_DIR / "canada_stress_index_timeseries.csv").sort_values(["province", "year"])
+    step = ca.groupby("province")["peak_load_mw"].diff().dropna()
+    first_step = ca.groupby("province")["peak_load_mw"].apply(lambda s: s.iloc[1] - s.iloc[0])
+    smooth = (first_step - step.groupby(ca["province"]).mean()).abs().max() < 1.0
+    print(f"  [{'PASS' if smooth else 'FAIL'}] Canadian peaks rise evenly from 2025 (no 2026 jump)")
+
+    gdb_ok = (GIS_DIR / "ggr442_grid_stress.gdb").exists()
+    print(f"  [{'PASS' if gdb_ok else 'FAIL'}] GIS geodatabase exported")
+    return all([not missing, full, no_new_2025, monotone, conserved, artifacts_ok, smooth, gdb_ok])
 
 
 def legacy_benchmarks():

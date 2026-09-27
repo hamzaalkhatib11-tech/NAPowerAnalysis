@@ -16,6 +16,7 @@ STEPS = [
     "canada_footprint_mw.py",
     "canada_stress.py",
     "us_time_series.py",
+    "export_gis.py",
     "verify_outputs.py",
 ]
 

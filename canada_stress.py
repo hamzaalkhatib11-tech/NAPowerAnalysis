@@ -51,9 +51,13 @@ def load_cer_capacity(years) -> pd.DataFrame:
 
 
 def projected_peak(peak_base: float, ratio_2050: float, year: int) -> float:
-    """Linear interpolation of the CER 2021->2050 peak growth ratio, applied to the 2025 peak."""
-    frac = (year - FIG8_BASE_YEAR) / (FIG8_END_YEAR - FIG8_BASE_YEAR)
-    return peak_base * (1 + (ratio_2050 - 1) * frac)
+    """2035 target: the 2025 peak x the CER 2021->2050 growth ratio interpolated to
+    2035 (the handoff's formula). Years in between are interpolated linearly from
+    the 2025 peak to that target -- applying the 2021-based fraction to each year
+    directly would make every year after 2025 jump by four years' growth."""
+    frac = (TARGET_YEAR - FIG8_BASE_YEAR) / (FIG8_END_YEAR - FIG8_BASE_YEAR)
+    target = peak_base * (1 + (ratio_2050 - 1) * frac)
+    return peak_base + (target - peak_base) * (year - BASE_YEAR) / (TARGET_YEAR - BASE_YEAR)
 
 
 def ieso_dc_twh(year: int) -> float:
