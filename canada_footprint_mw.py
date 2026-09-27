@@ -1,43 +1,39 @@
 """
 canada_footprint_mw.py
 
-Extends the North America harmonization pipeline with real MW estimates for
-Canadian data centers, using Microsoft Global Building Footprint tiles
-(the 23 zoom-9 quadkey tiles identified as containing the 63 Canadian points
-in harmonized_existing_dc_with_ba.csv).
+Real MW estimates for Canadian data centres from Microsoft Global Building
+Footprint tiles (PROJECT_HANDOFF.md §4). For each Canadian point:
+  1. Compute its zoom-9 quadkey and find the matching tile.
+  2. Find the nearest building centroid within FOOTPRINT_SEARCH_RADIUS_M
+     (BallTree; area is computed only for the winning polygon).
+  3. Geodesic area -> sqft -> MW with the same W_PER_SQFT as the U.S. layer.
 
-For each Canadian point:
-  1. Load its matching tile (line-delimited GeoJSON of building polygons).
-  2. Find the nearest building footprint polygon to the point, within a
-     search radius (SEARCH_RADIUS_M).
-  3. Compute that polygon's geodesic area (accounts for latitude, unlike a
-     naive planar degree-based area).
-  4. Convert area -> sqft -> MW using the same W_PER_SQFT assumption used
-     for the U.S. IM3-derived estimates, so the two are directly comparable.
+Reads output/harmonized_existing_dc_with_ba.csv (from harmonize_datacenters.py).
+Writes output/canada_building_footprint_tiles_needed.csv,
+       output/canada_dc_with_mw.csv and a refreshed output/canada_dc_by_province.csv.
 
-Output: canada_dc_with_mw.csv, plus a refreshed canada_dc_by_province.csv
+Tiles live in data/ as part-*.csv.gz. Their filenames only carry a Spark
+part number, which is NOT unique across quadkeys (part-00179 is both Calgary
+and Montreal), so a tile is matched to its quadkey by reading its content.
 """
 
 import gzip
 import json
 import re
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from pyproj import Geod
-from shapely.geometry import shape as shapely_shape, Point
+from shapely.geometry import shape as shapely_shape
 from sklearn.neighbors import BallTree
 
-DATA_DIR = Path("/mnt/user-data/uploads")
-OUT_DIR = Path("/home/claude/output")
+from config import (
+    DATA_DIR, EARTH_RADIUS_M, FOOTPRINT_LINKS_CSV, FOOTPRINT_SEARCH_RADIUS_M, FOOTPRINT_ZOOM,
+    GEOCODE_FIXES, OUT_DIR, SQM_TO_SQFT, W_PER_SQFT, lat_lon_to_quadkey,
+)
+
 POINTS_CSV = OUT_DIR / "harmonized_existing_dc_with_ba.csv"
 TILES_NEEDED_CSV = OUT_DIR / "canada_building_footprint_tiles_needed.csv"
-
-W_PER_SQFT = 150.0            # same assumption as the US sqft_derived method
-SEARCH_RADIUS_M = 200.0       # max distance from point to nearest building
-SQM_TO_SQFT = 10.7639
-EARTH_RADIUS_M = 6_371_000.0
 
 geod = Geod(ellps="WGS84")
 
@@ -48,184 +44,129 @@ def geodesic_area_sqm(polygon) -> float:
     return abs(area)
 
 
-def load_tile(path: Path):
-    """Load a gzipped line-delimited GeoJSON tile. Returns (BallTree over
-    centroids, list of polygons) -- area is computed lazily, only for
-    whichever polygon actually ends up being the nearest match to a point."""
-    centroids = []
-    polygons = []
+def load_tile(path):
+    """Gzipped line-delimited GeoJSON -> (BallTree over centroids, polygons)."""
+    centroids, polygons = [], []
     with gzip.open(path, "rt", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
-                feat = json.loads(line)
-                poly = shapely_shape(feat["geometry"])
-                if poly.is_empty:
-                    continue
+                poly = shapely_shape(json.loads(line)["geometry"])
             except Exception:
                 continue
+            if poly.is_empty:
+                continue
             c = poly.centroid
-            centroids.append((c.y, c.x))  # lat, lon for haversine
+            centroids.append((c.y, c.x))
             polygons.append(poly)
-
     if not centroids:
         return None, []
-
-    coords_rad = np.radians(np.array(centroids))
-    tree = BallTree(coords_rad, metric="haversine")
-    return tree, polygons
+    return BallTree(np.radians(np.array(centroids)), metric="haversine"), polygons
 
 
-def nearest_building_area(pt_lon: float, pt_lat: float, tree, polygons: list, radius_m: float):
+def nearest_building_area(lat, lon, tree, polygons, radius_m):
     if tree is None:
         return None, None
-    query = np.radians([[pt_lat, pt_lon]])
-    dist_rad, idx = tree.query(query, k=1)
+    dist_rad, idx = tree.query(np.radians([[lat, lon]]), k=1)
     dist_m = dist_rad[0][0] * EARTH_RADIUS_M
     if dist_m > radius_m:
         return None, dist_m
-    poly = polygons[idx[0][0]]
-    return geodesic_area_sqm(poly), dist_m
+    return geodesic_area_sqm(polygons[idx[0][0]]), dist_m
 
+
+def first_coord_quadkey(path) -> str:
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        feat = json.loads(f.readline())
+    lon, lat = feat["geometry"]["coordinates"][0][0][:2]
+    return lat_lon_to_quadkey(lat, lon, FOOTPRINT_ZOOM)
+
+
+def tiles_needed(quadkeys) -> pd.DataFrame:
+    # dtype=str: pandas would otherwise parse QuadKey as int and drop leading zeros
+    links = pd.read_csv(FOOTPRINT_LINKS_CSV, dtype={"QuadKey": str})
+    links = links[(links["Location"] == "Canada") & links["QuadKey"].isin(set(quadkeys))]
+    return links[["QuadKey", "Url", "Size"]].sort_values("QuadKey").reset_index(drop=True)
+
+
+def resolve_tile_paths(needed: pd.DataFrame) -> dict:
+    """quadkey -> local tile path, resolving duplicate part numbers by content."""
+    candidates = {}
+    for path in DATA_DIR.glob("part-*.gz"):
+        m = re.search(r"part-(\d+)-", path.name)
+        if m:
+            candidates.setdefault(m.group(1), []).append(path)
+
+    resolved = {}
+    for _, row in needed.iterrows():
+        part = re.search(r"part-(\d+)-", row["Url"]).group(1)
+        for path in candidates.get(part, []):
+            if len(candidates[part]) == 1 or first_coord_quadkey(path) == row["QuadKey"]:
+                resolved[row["QuadKey"]] = path
+                break
+    return resolved
 
 
 def main():
     points = pd.read_csv(POINTS_CSV)
-    ca_points = points[points["country"] == "Canada"].copy().reset_index(drop=True)
+    ca = points[points["country"] == "Canada"].copy().reset_index(drop=True)
+    ca["quadkey_z9"] = [lat_lon_to_quadkey(lat, lon, FOOTPRINT_ZOOM) for lat, lon in zip(ca["lat"], ca["lon"])]
 
-    tiles_needed = pd.read_csv(TILES_NEEDED_CSV, dtype={"QuadKey": str})
-    tiles_needed["part_num"] = tiles_needed["Url"].str.extract(r"part-(\d+)-")
-
-    # map each quadkey -> local file path. Filenames only carry a Spark
-    # "part-NNNNN" number, which is NOT globally unique across quadkeys
-    # (two different quadkey folders can both produce a part-00179, and the
-    # browser disambiguates re-downloads with a "__1__" suffix that carries
-    # no quadkey information). So: for any part number claimed by more than
-    # one needed quadkey, resolve by content -- read the first coordinate of
-    # each candidate file and check which needed quadkey's tile it actually
-    # falls inside, rather than trusting the filename alone.
-    def first_coord_quadkey(path: Path, zoom: int = 9) -> str:
-        import math
-        with gzip.open(path, "rt", encoding="utf-8") as f:
-            line = f.readline()
-        feat = json.loads(line)
-        lon, lat = feat["geometry"]["coordinates"][0][0]
-        lat_rad = math.radians(lat)
-        x = (lon + 180.0) / 360.0
-        y = (1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0
-        n = 2 ** zoom
-        tile_x = int(x * n)
-        tile_y = int(y * n)
-        quadkey = ""
-        for i in range(zoom, 0, -1):
-            digit = 0
-            mask = 1 << (i - 1)
-            if tile_x & mask:
-                digit += 1
-            if tile_y & mask:
-                digit += 2
-            quadkey += str(digit)
-        return quadkey
-
-    part_num_to_candidates = {}
-    local_files = {f.name: f for f in DATA_DIR.glob("part-*.gz")}
-    for fname, fpath in local_files.items():
-        m = re.search(r"part-(\d+)-", fname)
-        if m:
-            part_num_to_candidates.setdefault(m.group(1), []).append(fpath)
-
-    quadkey_to_path = {}
-    for _, row in tiles_needed.iterrows():
-        candidates = part_num_to_candidates.get(row["part_num"], [])
-        if len(candidates) == 1:
-            quadkey_to_path[row["QuadKey"]] = candidates[0]
-        elif len(candidates) > 1:
-            for cand in candidates:
-                if first_coord_quadkey(cand) == row["QuadKey"]:
-                    quadkey_to_path[row["QuadKey"]] = cand
-                    break
-
-    print(f"{len(quadkey_to_path)} / {len(tiles_needed)} needed tiles resolved to local files")
-
-    # recompute each point's quadkey the same way as before (zoom 9)
-    import math
-
-    def lat_lon_to_quadkey(lat, lon, zoom):
-        lat_rad = math.radians(lat)
-        x = (lon + 180.0) / 360.0
-        y = (1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0
-        n = 2 ** zoom
-        tile_x = int(x * n)
-        tile_y = int(y * n)
-        quadkey = ""
-        for i in range(zoom, 0, -1):
-            digit = 0
-            mask = 1 << (i - 1)
-            if tile_x & mask:
-                digit += 1
-            if tile_y & mask:
-                digit += 2
-            quadkey += str(digit)
-        return quadkey
-
-    ca_points["quadkey_z9"] = ca_points.apply(
-        lambda r: lat_lon_to_quadkey(r["lat"], r["lon"], 9), axis=1
-    )
+    needed = tiles_needed(ca["quadkey_z9"])
+    needed.to_csv(TILES_NEEDED_CSV, index=False)
+    quadkey_to_path = resolve_tile_paths(needed)
+    print(f"{len(quadkey_to_path)} / {len(needed)} needed tiles resolved to local files")
+    missing = sorted(set(needed["QuadKey"]) - set(quadkey_to_path))
+    for qk in missing:
+        url = needed.loc[needed["QuadKey"] == qk, "Url"].iloc[0]
+        print(f"  MISSING tile {qk}: download {url}")
 
     tile_cache = {}
     areas, dists, methods = [], [], []
-    for _, row in ca_points.iterrows():
+    for _, row in ca.iterrows():
         qk = row["quadkey_z9"]
         path = quadkey_to_path.get(qk)
         if path is None:
-            areas.append(None)
-            dists.append(None)
-            methods.append("no_tile_available")
+            areas.append(None); dists.append(None); methods.append("no_tile_available")
             continue
         if qk not in tile_cache:
-            print(f"Loading tile {qk} ({path.name}) ...")
+            print(f"  loading tile {qk} ({path.name}) ...")
             tile_cache[qk] = load_tile(path)
-        tree, polygons = tile_cache[qk]
-        area, dist = nearest_building_area(row["lon"], row["lat"], tree, polygons, SEARCH_RADIUS_M)
-        areas.append(area)
-        dists.append(dist)
+        area, dist = nearest_building_area(row["lat"], row["lon"], *tile_cache[qk], FOOTPRINT_SEARCH_RADIUS_M)
+        areas.append(area); dists.append(dist)
         methods.append("footprint_matched" if area is not None else "no_building_within_radius")
 
-    ca_points["nearest_building_area_sqm"] = areas
-    ca_points["nearest_building_dist_m"] = dists
-    ca_points["footprint_match_method"] = methods
-    ca_points["sqft"] = ca_points["nearest_building_area_sqm"] * SQM_TO_SQFT
-    ca_points["mw_estimate"] = np.where(
-        ca_points["sqft"].notna(),
-        (ca_points["sqft"] * W_PER_SQFT) / 1_000_000.0,
-        np.nan,
-    )
-    ca_points["mw_method"] = np.where(
-        ca_points["mw_estimate"].notna(), "footprint_derived", "unknown"
-    )
+    ca["nearest_building_area_sqm"] = areas
+    ca["nearest_building_dist_m"] = dists
+    ca["footprint_match_method"] = methods
+    ca["sqft"] = pd.to_numeric(ca["nearest_building_area_sqm"]) * SQM_TO_SQFT
+    ca["mw_estimate"] = ca["sqft"] * W_PER_SQFT / 1_000_000.0
+    ca["mw_method"] = np.where(ca["mw_estimate"].notna(), "footprint_derived", "unknown")
 
-    out_path = OUT_DIR / "canada_dc_with_mw.csv"
-    ca_points.to_csv(out_path, index=False)
-    print(f"Wrote {out_path}")
+    # sanity-check the manual geocode fixes landed on the expected building
+    for fix in GEOCODE_FIXES:
+        hit = ca[ca["name"] == fix["name"]]
+        if hit.empty:
+            print(f"  WARNING: {fix['name']} not among Canadian points")
+        elif "expected_footprint_mw" in fix:
+            mw = hit["mw_estimate"].iloc[0]
+            ok = pd.notna(mw) and abs(mw - fix["expected_footprint_mw"]) < 0.05
+            print(f"  {fix['name']}: {mw:.2f} MW (expected ~{fix['expected_footprint_mw']}) "
+                  f"{'OK' if ok else 'MISMATCH'}")
 
-    matched = ca_points["mw_method"].eq("footprint_derived").sum()
-    print(f"\n{matched} / {len(ca_points)} Canadian points got a footprint-derived MW estimate")
+    ca.to_csv(OUT_DIR / "canada_dc_with_mw.csv", index=False)
+    matched = (ca["mw_method"] == "footprint_derived").sum()
+    print(f"{matched} / {len(ca)} Canadian points got a footprint-derived MW estimate")
 
     summary = (
-        ca_points.groupby("joined_province", dropna=True)
-        .agg(
-            facility_count=("mw_estimate", "size"),
-            known_mw_total=("mw_estimate", "sum"),
-            unknown_mw_count=("mw_method", lambda s: (s == "unknown").sum()),
-        )
-        .reset_index()
-        .sort_values("known_mw_total", ascending=False)
+        ca.groupby("joined_province", dropna=True)
+        .agg(facility_count=("mw_estimate", "size"),
+             known_mw_total=("mw_estimate", "sum"),
+             unknown_mw_count=("mw_method", lambda s: (s == "unknown").sum()))
+        .reset_index().sort_values("known_mw_total", ascending=False)
     )
-    summary_out = OUT_DIR / "canada_dc_by_province.csv"
-    summary.to_csv(summary_out, index=False)
-    print(f"Wrote {summary_out}")
+    summary.to_csv(OUT_DIR / "canada_dc_by_province.csv", index=False)
     print(summary.to_string(index=False))
 
 
