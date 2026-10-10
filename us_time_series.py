@@ -22,6 +22,9 @@ Supply
   + planned units with approvals or under construction (EIA_PLANNED_STATUSES)
   - units retired after the HIFLD year (Retired sheet)
   - operating units with a planned retirement year from 2026 on
+  + from TREND_START_YEAR, a top-up so each BA adds at least its own 2021-2025
+    average build rate per year (EIA's pipeline thins out after ~3 years);
+    the pipeline-only figures are kept as a sensitivity
   Capacity is EIA net summer MW, not derated for solar/wind availability.
 
 Peak
@@ -57,7 +60,8 @@ from shapely.geometry import shape as shapely_shape
 from config import (
     DATA_ARTIFACT_BAS, EIA860M_XLSX, EIA930_FILES, EIA_BA_CODE_TO_HIFLD, EIA_CAPACITY_COLUMN,
     EIA_PLANNED_STATUSES, GROWTH_PUE, GROWTH_SCENARIO_ANNUAL_RATE, NON_DC_PEAK_GROWTH, OUT_DIR,
-    PEAK_SCOPE_RATIO, PEAK_SPIKE_FACTOR, TS_YEARS,
+    PEAK_SCOPE_RATIO, PEAK_SPIKE_FACTOR, TREND_BUILD_FACTOR, TREND_HISTORY_YEARS, TREND_START_YEAR,
+    TS_YEARS,
 )
 from geo import join_ba, load_control_areas
 
@@ -137,15 +141,29 @@ def capacity_changes(sheets: dict, ba_base_year: pd.Series) -> pd.DataFrame:
         op_ret[["ba_name", "Planned Retirement Year", "mw"]].rename(columns={"Planned Retirement Year": "year"}),
     ])
 
+    # recent build rate: units that came online in TREND_HISTORY_YEARS (whether
+    # still operating or since retired), averaged per year
+    h0, h1 = TREND_HISTORY_YEARS
+    built = additions.iloc[: len(op) + len(rt)]
+    built = built[built["year"].between(h0, h1)]
+    build_rate = built.groupby("ba_name")["mw"].sum() / (h1 - h0 + 1) * TREND_BUILD_FACTOR
+    committed = pl.groupby(["ba_name", "Planned Operation Year"])["mw"].sum()
+
     rows = []
     for ba, base in ba_base_year.items():
         add_ba = additions[additions["ba_name"] == ba]
         ret_ba = retirements[retirements["ba_name"] == ba]
+        rate = float(build_rate.get(ba, 0.0))
+        trend_cum = 0.0
         for year in TS_YEARS:
+            if year >= TREND_START_YEAR:
+                trend_cum += max(0.0, rate - float(committed.get((ba, year), 0.0)))
             rows.append({
                 "ba_name": ba, "year": year,
                 "cap_added_mw": add_ba.loc[(add_ba["year"] > base) & (add_ba["year"] <= year), "mw"].sum(),
                 "cap_retired_mw": ret_ba.loc[(ret_ba["year"] > base) & (ret_ba["year"] <= year), "mw"].sum(),
+                "cap_trend_added_mw": trend_cum,
+                "recent_build_rate_mw_yr": rate,
             })
     return pd.DataFrame(rows)
 
@@ -269,13 +287,16 @@ def main():
         dc_new = float(new_2035.get(ba, 0.0)) * ramp(year)
         dc = dc_existing + dc_new
         if has_cap:
-            cap = rec["TOTAL_CAP"] + ch["cap_added_mw"] - ch["cap_retired_mw"]
+            cap_pipeline = rec["TOTAL_CAP"] + ch["cap_added_mw"] - ch["cap_retired_mw"]
+            cap = cap_pipeline + ch["cap_trend_added_mw"]
             baseline = max(pk["system_peak_mw"] - dc_existing, 0.0)
             peak = baseline * (1 + NON_DC_PEAK_GROWTH) ** max(0, year - pk["peak_year"])
             avail = cap - peak
             stress = dc / avail if avail > 0 else np.nan
+            avail_pipeline = cap_pipeline - peak
+            stress_pipeline = dc / avail_pipeline if avail_pipeline > 0 else np.nan
         else:
-            cap = peak = avail = stress = np.nan
+            cap = peak = avail = stress = cap_pipeline = stress_pipeline = np.nan
         artifact = ba in artifacts
         rows.append({
             "BA_NAME": ba,
@@ -296,6 +317,9 @@ def main():
             "DC_NEW_MW": dc_new,
             "CAP_ADDED_MW": ch["cap_added_mw"],
             "CAP_RETIRED_MW": ch["cap_retired_mw"],
+            "CAP_TREND_ADDED_MW": ch["cap_trend_added_mw"],
+            "TOTAL_CAP_PIPELINE_ONLY_MW": cap_pipeline,
+            "STRESS_INDEX_PIPELINE_ONLY": stress_pipeline,
         })
     ts = pd.DataFrame(rows)
     ts.to_csv(OUT_DIR / "us_ba_time_series_2025_2035.csv", index=False, float_format="%.4f")
@@ -309,6 +333,9 @@ def main():
         print(f"\nTop 10 BAs by stress index, {year} (artifacts excluded):")
         print(top.to_string(index=False, float_format=lambda v: f"{v:,.3f}"))
     print("\n2035 classes:", valid[valid["YEAR"] == LAST_YEAR]["STRESS_CLASS"].value_counts().to_dict())
+    y35 = valid[valid["YEAR"] == LAST_YEAR]
+    print(f"BAs over 1.0 in {LAST_YEAR}: trend scenario {int((y35['STRESS_INDEX'] > 1).sum())}, "
+          f"pipeline-only {int((y35['STRESS_INDEX_PIPELINE_ONLY'] > 1).sum())}")
 
 
 if __name__ == "__main__":

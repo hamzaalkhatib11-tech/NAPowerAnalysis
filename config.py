@@ -134,6 +134,31 @@ DATA_ARTIFACT_BAS = {
                                     "(~1.1 GW); no headroom even in 2025",
 }
 
+# ----------------------------------------------------------------------------
+# Local (hex) stress (local_stress.py)
+# ----------------------------------------------------------------------------
+TRANSMISSION_ZIP = DATA_DIR / "US_Electric_Power_Transmission_Lines_-124296575735781399.zip"
+HEX_CRS = "EPSG:5070"           # NAD83 / CONUS Albers, equal-area metres
+HEX_WIDTH_M = 25_000.0          # flat-to-flat width (~540 km2 per hex)
+EXCLUDED_STATES = {"AK", "HI", "PR", "VI", "GU", "AS", "MP"}   # CONUS only
+# Large data centres connect at 115-161 kV as well as 230 kV+ (TVA's backbone is
+# 161 kV), so sub-transmission from 115 kV counts. Lower voltages can't carry a
+# campus-scale load.
+MIN_LINE_KV = 115
+# Approximate per-circuit carrying capacity by voltage class, MW. Short line
+# segments are thermally limited rather than stability-limited, so these sit
+# above surge-impedance loading. Screening values only.
+LINE_RATING_MW_BY_KV = [        # <-- REVIEW: cite a published table before publishing
+    (735, 4000),
+    (500, 2500),
+    (345, 1200),
+    (230, 500),
+    (138, 250),
+    (115, 175),
+]
+LINE_KV_VALID = (1, 1100)       # HIFLD uses -999999 for unknown voltage
+LOCAL_STRESS_CAP = 3.0          # analysis field is capped so one hex can't dominate a hot spot run
+
 # GIS export (export_gis.py)
 GIS_DIR = OUT_DIR / "gis"
 GIS_SIMPLIFY_M = 500.0          # polygon simplification tolerance (Web Mercator metres)
@@ -142,6 +167,17 @@ EIA_CAPACITY_COLUMN = "Net Summer Capacity (MW)"
 # (T) approved, (U) <=50% built, (V) >50% built, (TS) built, not yet operating.
 # (P) and (L) projects -- no approvals yet -- are excluded as too speculative.
 EIA_PLANNED_STATUSES = ("(T)", "(U)", "(V)", "(TS)")
+
+# EIA-860M only sees about 3 years ahead: committed additions fall from ~49 GW
+# (2026) to ~7 GW (2029) and ~2 GW/yr after, while BAs actually built ~44 GW/yr
+# in 2021-2025 and scheduled retirements keep coming. Taken literally that means
+# building stops around 2029. From TREND_START_YEAR on, each BA therefore adds
+# at least its own 2021-2025 average build rate x TREND_BUILD_FACTOR per year
+# (the committed pipeline is used where it is larger). The pipeline-only result
+# is kept alongside as a sensitivity (STRESS_INDEX_PIPELINE_ONLY).
+TREND_HISTORY_YEARS = (2021, 2025)
+TREND_START_YEAR = 2028
+TREND_BUILD_FACTOR = 1.0        # <-- REVIEW: 1.0 = keep building at the recent pace
 
 # EIA-860M "Balancing Authority Code" -> HIFLD Control_Areas NAME. Generators are
 # assigned by EIA's code, not by plant location: BA polygons overlap (APS/SRP,

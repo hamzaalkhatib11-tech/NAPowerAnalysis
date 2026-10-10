@@ -11,6 +11,7 @@ Background, data sources and methodology are in [PROJECT_HANDOFF.md](PROJECT_HAN
 | `canada_footprint_mw.py` | Canadian MW from Microsoft building footprints |
 | `canada_stress.py` | Canadian headroom and stress index, 2025 to 2035 (yearly), IESO Ontario growth |
 | `us_time_series.py` | U.S. BA stress index for each year 2025 to 2035, written to `output/us_ba_time_series_2025_2035.csv` for the Experience Builder year slider |
+| `local_stress.py` | Local stress on a 25 km hexagon grid, 2025 to 2035: data-centre load ÷ high-voltage supply reachable from each hex |
 | `export_gis.py` | Joins the time series to BA and province polygons and writes time-enabled layers to `output/gis/` (File Geodatabase, zipped copy, GeoJSON) |
 | `geo.py` | Shared point-in-polygon helpers |
 | `verify_outputs.py` | Diffs `output/` against `reference_outputs/`, then checks invariants and the time series |
@@ -26,7 +27,7 @@ pip install pandas numpy pyproj shapely pyshp scikit-learn openpyxl
 python run_pipeline.py
 ```
 
-The full run takes about 13 minutes, mostly loading footprint tiles. Pass `--skip-footprint` to reuse the existing Canadian footprint results.
+The full run takes about 17 minutes, mostly loading footprint tiles. Pass `--skip-footprint` to reuse the existing Canadian footprint results.
 
 ## Inputs expected in `data/`
 
@@ -37,6 +38,7 @@ The full run takes about 13 minutes, mostly loading footprint tiles. Pass `--ski
 - `EIA930_BALANCE_2025_Jan_Jun.csv` and `EIA930_BALANCE_2025_Jul_Dec.csv`: EIA-930 hourly demand, from eia.gov/electricity/gridmonitor/sixMonthFiles
 - `control-areas-shapefile/`
 - `tl_2025_us_state.zip`
+- `US_Electric_Power_Transmission_Lines_-124296575735781399.zip`: HIFLD transmission lines, used by the local tier
 - `lpr_000b21a_e.zip`
 - `dataset-links.csv` and `electricity-capacity-technology-2026.csv`. Extract them from `GGR442_Datasets.zip`.
 - `2023-data-supplement-figures-supplement-donnees-2023.xlsx`
@@ -45,12 +47,22 @@ The full run takes about 13 minutes, mostly loading footprint tiles. Pass `--ski
 ## U.S. time-series method (`us_time_series.py`)
 
 - **Demand:** the 2025 existing load (the point layer scaled to Databricks Active state totals) plus new IM3 sites for 2035 (high growth, 50% gravity). New sites are counted as IT load × PUE 1.2 and ramped at the scenario's own 10%/yr rate.
-- **Supply:** HIFLD 2020 capacity rolled forward with EIA-860M additions and retirements. Units are assigned to BAs by EIA's BA code (see `EIA_BA_CODE_TO_HIFLD` in `config.py`). Planned units count only if they have approval or are under construction.
+- **Supply:** HIFLD 2020 capacity rolled forward with EIA-860M additions and retirements. From 2028 on, each BA adds at least its own 2021–2025 average build rate each year, because EIA lists almost no new plants after 2029. `STRESS_INDEX_PIPELINE_ONLY` keeps the committed-pipeline-only result as a sensitivity case. Units are assigned to BAs by EIA's BA code (see `EIA_BA_CODE_TO_HIFLD` in `config.py`). Planned units count only if they have approval or are under construction.
 - **Peak:** the EIA-930 2025 hourly peak (adjusted demand, with spikes filtered out), or HIFLD's peak where EIA-930's BA boundary doesn't match HIFLD's. `PEAK_LOAD_MW` is the baseline, non-data-centre peak: the system peak minus existing data-centre load. `SYSTEM_PEAK_MW` is the total.
 - **Headroom:** `AVAIL_CAP_MW = TOTAL_CAP_MW - PEAK_LOAD_MW`, and `STRESS_INDEX = DC_LOAD_MW / AVAIL_CAP_MW`. So `STRESS_INDEX > 1` exactly when capacity can't cover the system peak.
 - **Data artifacts:** `DATA_ARTIFACT_FLAG` marks BAs whose numbers reflect how the data is defined rather than real grid conditions. These are Duke Energy Florida, IID, and any BA whose 2025 capacity is below its own 2025 peak.
 - **Assumptions to review in `config.py`:** `W_PER_SQFT`, `GROWTH_PUE` (1.2), `NON_DC_PEAK_GROWTH` (0.0, so the baseline peak is held at its 2025 level) and `EIA_PLANNED_STATUSES`.
 - **Legacy file:** `ba_level_stress_index.csv` keeps the old HIFLD snapshot basis (load / `AVAIL_CAP`) for comparison with the handoff.
+
+## Local (hex) tier (`local_stress.py`)
+
+The BA index asks "is there enough generation in the region?" The hex index asks "can power be delivered here?"
+
+- **Grid:** 15,431 flat-topped hexagons, 25 km across, covering the lower 48 states (CONUS Albers projection).
+- **`DC_LOAD_MW`:** the same data-centre load as the BA tier, located at its points. Hex totals add up to the BA totals.
+- **`LOCAL_SUPPLY_MW`:** generation located in the hex (EIA-860M, by year, including each BA's build-rate top-up placed where that BA built in 2021–2025), plus transmission lines of 115 kV and above that cross the hex boundary, rated by voltage class (`LINE_RATING_MW_BY_KV`, to be cited).
+- **`LOCAL_STRESS`:** `DC_LOAD_MW / LOCAL_SUPPLY_MW`. Existing local demand is **not** subtracted, so this ranks hexes against each other: 1.0 is not a capacity gap the way it is for the BA index. It's a screening index, not a power-flow study.
+- **`LOCAL_STRESS_CAPPED`:** capped at 3.0, and set to 3.0 where a hex has data-centre load but no line of 115 kV or above (`NO_HV_ACCESS = 1`). This is the field to use for hot spot analysis.
 
 ## ArcGIS
 
@@ -67,6 +79,8 @@ Two things are ready to upload:
 | `ca_province_stress_timeseries` | Canadian province stress, 66 polygons, same schema |
 | `dc_existing_points` | Existing data centres |
 | `dc_growth_sites_2035` | IM3 projected sites for 2035 |
+| `us_hex_local_stress_timeseries` | 169,741 hexagons (15,431 × 11 years). Time field: `YEAR_DATE` |
+| `transmission_115kv_plus` | 51,097 lines of 115 kV and above, with the MW rating used |
 
 **To set up the time slider:**
 
@@ -74,3 +88,13 @@ Two things are ready to upload:
 2. In Experience Builder, add one Timeline widget that drives both layers.
 3. Symbolize `STRESS_INDEX` with a diverging ramp centred on 1.0.
 4. Grey out features where `DATA_ARTIFACT_FLAG = 1`.
+
+**Hot spot analysis (ArcGIS Pro):**
+
+1. Run **Create Space Time Cube From Defined Locations** on `us_hex_local_stress_timeseries`:
+   - Location ID: `HEX_ID`
+   - Time field: `YEAR_DATE`
+   - Time step: 1 year
+   - Variable: `LOCAL_STRESS_CAPPED`, with zeros as the fill for empty bins
+2. Run **Emerging Hot Spot Analysis** on the resulting cube. It labels each hex as a new, intensifying, persistent or sporadic hot spot.
+3. Run it again with `DC_LOAD_MW` as the variable. That shows where demand alone clusters, which is useful to compare against.

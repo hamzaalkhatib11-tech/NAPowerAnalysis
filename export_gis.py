@@ -9,6 +9,9 @@ time-enabled layers to output/gis/:
     ca_province_stress_timeseries  6 provinces x 2025-2035 (66 polygons), same schema
     dc_existing_points             deduplicated existing data centres (2025 layer)
     dc_growth_sites_2035           IM3 projected new sites (high growth, 50% gravity)
+    us_hex_local_stress_timeseries 15,431 hexes x 2025-2035 (local_stress.py); feed
+                                   LOCAL_STRESS_CAPPED to Emerging Hot Spot Analysis
+    transmission_115kv_plus        HIFLD lines >= 115 kV with the MW rating used
   us_ba_stress_timeseries.geojson / ca_province_stress_timeseries.geojson
                                    same time layers for a direct ArcGIS Online upload
                                    (set YEAR_DATE as the time field; it is ISO text there)
@@ -37,6 +40,8 @@ from config import (
     CONTROL_AREAS_SHP, GIS_DIR, GIS_SIMPLIFY_M, OUT_DIR, STATCAN_PROVINCES_ZIP,
 )
 from geo import read_prj, read_prj_from_zip
+from config import HEX_CRS
+from local_stress import load_hv_lines
 
 GDB = GIS_DIR / "ggr442_grid_stress.gdb"
 WGS84 = "EPSG:4326"
@@ -192,6 +197,24 @@ def main():
     growth = pd.DataFrame([feat["properties"] for feat in gj["features"]])
     growth["geometry"] = [shapely_shape(feat["geometry"]) for feat in gj["features"]]
     write_layer(growth, "dc_growth_sites_2035", "MultiPolygon")
+
+    print("Hex layers ...")
+    with open(OUT_DIR / "us_hex_grid.geojson", encoding="utf-8") as f:
+        hex_feats = json.load(f)["features"]
+    hex_geom = pd.DataFrame({"HEX_ID": [ft["properties"]["HEX_ID"] for ft in hex_feats],
+                             "geometry": [shapely_shape(ft["geometry"]) for ft in hex_feats]})
+    hx = pd.read_csv(OUT_DIR / "us_hex_local_stress_2025_2035.csv").merge(hex_geom, on="HEX_ID", how="left")
+    assert hx["geometry"].notna().all(), "hex polygon missing"
+    hx["BA_NAME"] = hx["BA_NAME"].fillna("")
+    write_layer(hx, "us_hex_local_stress_timeseries", "Polygon")
+
+    lines = load_hv_lines()
+    to_wgs = Transformer.from_crs(HEX_CRS, WGS84, always_xy=True)
+    geoms = shapely.simplify(lines["geometry"].to_numpy(), 100.0)
+    lines["geometry"] = shapely.transform(geoms, lambda xy: np.column_stack(to_wgs.transform(xy[:, 0], xy[:, 1])))
+    write_layer(lines[["kv", "rating_mw", "VOLT_CLASS", "STATUS", "OWNER", "geometry"]]
+                .rename(columns={"kv": "VOLTAGE_KV", "rating_mw": "RATING_MW"}),
+                "transmission_115kv_plus", "MultiLineString")
 
     # zip the .gdb so it can be uploaded to ArcGIS Online as a single file
     archive = shutil.make_archive(str(GIS_DIR / "ggr442_grid_stress.gdb"), "zip", GIS_DIR, GDB.name)

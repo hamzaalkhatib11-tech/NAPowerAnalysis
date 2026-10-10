@@ -141,6 +141,29 @@ def time_series_checks() -> bool:
     return all([not missing, full, no_new_2025, monotone, conserved, artifacts_ok, smooth, gdb_ok])
 
 
+def local_checks() -> bool:
+    """The hex tier must add up to the BA tier's data-centre load."""
+    hx = read(OUT_DIR / "us_hex_local_stress_2025_2035.csv")
+    ts = read(OUT_DIR / "us_ba_time_series_2025_2035.csv")
+    print("\n=== local (hex) tier ===")
+    ok = []
+    for year in (2025, 2035):
+        h = hx.loc[hx["YEAR"] == year, "DC_LOAD_MW"].sum()
+        b = ts.loc[ts["YEAR"] == year, "DC_LOAD_MW"].sum()
+        # the BA tier only counts points inside a BA polygon, so hexes may hold slightly more
+        good = b <= h + 1 and (h - b) / b < 0.02
+        ok.append(good)
+        print(f"  [{'PASS' if good else 'FAIL'}] {year} hex DC load {h:,.0f} MW vs BA tier {b:,.0f} MW")
+    per_hex = hx.groupby("HEX_ID")["YEAR"].nunique()
+    full = per_hex.eq(11).all()
+    ok.append(full)
+    print(f"  [{'PASS' if full else 'FAIL'}] every hex has 11 years ({len(per_hex):,} hexes)")
+    capped = hx["LOCAL_STRESS_CAPPED"].notna().all()
+    ok.append(capped)
+    print(f"  [{'PASS' if capped else 'FAIL'}] LOCAL_STRESS_CAPPED has no nulls (hot spot input)")
+    return all(ok)
+
+
 def legacy_benchmarks():
     """Handoff §6 U.S. figures. Informational: the campus / dedup / Active-only
     fixes are expected to move them."""
@@ -159,7 +182,7 @@ def main():
     for name in COUNT_FILES:
         compare_counts(name)
     legacy_benchmarks()
-    ok = invariants() & time_series_checks()
+    ok = invariants() & time_series_checks() & local_checks()
     return 0 if ok else 1
 
 
