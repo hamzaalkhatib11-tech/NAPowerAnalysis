@@ -157,7 +157,12 @@ MIN_LINE_KV = 115
 # ~1,190 at 345 kV, ~2,170 at 500 kV, ~3,980 at 735 kV.
 LINE_RATING_FIT = (0.1295, 1.565)
 LINE_KV_VALID = (1, 1100)       # HIFLD uses -999999 for unknown voltage
-LOCAL_STRESS_CAP = 3.0          # analysis field is capped so one hex can't dominate a hot spot run
+# Yearly hot spots of capacity gaps (Getis-Ord Gi*, binary weights within this
+# distance, self included). 75 km = the two rings of hexes around each hex
+# (~18 neighbours), roughly a metro area or a utility planning zone.
+GI_DISTANCE_M = 75_000.0
+GI_FDR = True                   # Benjamini-Hochberg correction, as in ArcGIS Optimized Hot Spot
+LOCAL_STRESS_CAP = 3.0         # analysis field is capped so one hex can't dominate a hot spot run
 # Below this, a hex's data-centre load is small enough to be served from the
 # distribution network, so having no >= 115 kV line isn't a pressure point. Without
 # it, a 2.7 MW site in Wisconsin was capped at 3.0 and seeded a 7-hex hot spot.

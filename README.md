@@ -57,13 +57,23 @@ The full run takes about 17 minutes, mostly loading footprint tiles. Pass `--ski
 
 ## Local (hex) tier (`local_stress.py`)
 
-The BA index asks "is there enough generation in the region?" The hex index asks "can power be delivered here?"
+The BA index says whether a region has headroom. The hex index says whether the share of that headroom deliverable in a given place covers the data centres planned there.
 
-- **Grid:** 15,431 flat-topped hexagons, 25 km across, covering the lower 48 states (CONUS Albers projection).
-- **`DC_LOAD_MW`:** the same data-centre load as the BA tier, located at its points. Hex totals add up to the BA totals.
-- **`LOCAL_SUPPLY_MW`:** generation located in the hex (EIA-860M, by year, including each BA's build-rate top-up placed where that BA built in 2021–2025), plus transmission lines of 115 kV and above that cross the hex boundary, rated by voltage with the power-law fit to FERC line data in Athari & Wang (2017), arXiv:1709.06930 (`LINE_RATING_FIT`).
-- **`LOCAL_STRESS`:** `DC_LOAD_MW / LOCAL_SUPPLY_MW`. Existing local demand is **not** subtracted, so this ranks hexes against each other: 1.0 is not a capacity gap the way it is for the BA index. It's a screening index, not a power-flow study.
-- **`LOCAL_STRESS_CAPPED`:** capped at 3.0, and set to 3.0 where a hex has data-centre load but no line of 115 kV or above (`NO_HV_ACCESS = 1`). This is the field to use for hot spot analysis.
+- **Grid:** 15,431 flat-topped hexagons, 25 km across, covering the lower 48 states.
+- **`LOCAL_HEADROOM_MW`:** the BA's headroom for that year (capacity minus non-data-centre peak, from the BA tier), multiplied by the hex's share of the BA's grid strength. It is never less than the hex's existing data-centre load, because what runs today is served.
+  - Grid strength is generation in the hex, plus lines of 115 kV and above crossing the hex boundary, rated with the FERC-data fit in Athari & Wang (2017), arXiv:1709.06930.
+  - Hex values add back up to the BA's headroom, so the two tiers agree.
+- **`LOCAL_STRESS`:** `DC_LOAD_MW / LOCAL_HEADROOM_MW`, where above 1 is a local gap.
+- **`DC_GAP_MW`:** the data-centre load that the local headroom can't serve.
+- **`LOCAL_CLASS`:** one of `no_dc`, `distribution_served`, `surplus`, `near_limit`, `gap`, `no_capacity_data` or `data_artifact`.
+- **Yearly hot spots of capacity gaps:**
+  - Getis-Ord Gi\* on `DC_GAP_MW` each year, with a 75 km neighbourhood and the same false-discovery correction ArcGIS's Optimized Hot Spot tool uses.
+  - Standardized against the pooled 2025–2035 mean, so years can be compared.
+  - Output fields: `GI_Z`, `GI_P`, `GI_BIN` (−3 to 3, the ArcGIS convention) and `GI_PATTERN`. These drive the year slider.
+- **Absolute local supply and demand were tested and rejected:**
+  - Gross line ratings found almost no gaps, because they count power passing through a hex as if it were available there.
+  - Spreading peak demand by Census population marked nearly every city as short before any data centre was built.
+- **It's a screening model, not a power-flow study.**
 
 ## ArcGIS
 
@@ -90,12 +100,18 @@ Two things are ready to upload:
 3. Symbolize `STRESS_INDEX` with a diverging ramp centred on 1.0.
 4. Grey out features where `DATA_ARTIFACT_FLAG = 1`.
 
-**Hot spot analysis (ArcGIS Pro):**
+**Hot spots of capacity gaps (the year slider):**
 
-1. Run **Create Space Time Cube From Defined Locations** on `us_hex_local_stress_timeseries`:
+On `us_hex_local_stress_timeseries`:
+
+1. Enable time on `YEAR_DATE` with a 1-year step.
+2. Symbolize with **Unique Values** on `GI_PATTERN`, using the ArcGIS hot spot colours, with "Not Significant" set to no fill.
+3. Add a second copy filtered to `LOCAL_CLASS = 'gap'` to show the hexes that are actually short.
+
+**Decade trend (static):**
+
+1. Run **Create Space Time Cube From Defined Locations** on the same layer:
    - Location ID: `HEX_ID`
-   - Time field: `YEAR_DATE`
-   - Time step: 1 year
-   - Variable: `LOCAL_STRESS_CAPPED`, with zeros as the fill for empty bins
-2. Run **Emerging Hot Spot Analysis** on the resulting cube. It labels each hex as a new, intensifying, persistent or sporadic hot spot.
-3. Run it again with `DC_LOAD_MW` as the variable. That shows where demand alone clusters, which is useful to compare against.
+   - Time field: `YEAR_DATE`, 1-year step
+   - Variable: `DC_GAP_MW`
+2. Run **Emerging Hot Spot Analysis** on the cube. It labels each hex as a new, intensifying or persistent hot spot over the decade.

@@ -1,42 +1,51 @@
 """
 local_stress.py
 
-Local (sub-BA) data-centre stress on a ~25 km hexagon grid, yearly 2025-2035.
+Local (sub-BA) capacity gaps on a ~25 km hexagon grid, yearly 2025-2035, and
+yearly hot spots of those gaps for the dashboard's year slider.
 
-The BA index (us_time_series.py) asks "is there enough generation in the
-region?". This one asks "can power be delivered *here*?" -- the transmission /
-substation side of the project question.
+The BA tier says whether a region has headroom; this says whether the part of
+that headroom deliverable in a given place covers the data centres planned there.
 
-  LOCAL_STRESS(hex, y) = DC_LOAD_MW / LOCAL_SUPPLY_MW
+  BA_HEADROOM_SHARE_MW = BA AVAIL_CAP_MW (capacity - non-DC baseline peak, from
+                         us_time_series.py) x the hex's share of the BA's grid
+                         strength
+  LOCAL_HEADROOM_MW    = max(BA_HEADROOM_SHARE_MW, DC_EXISTING_MW)
+                         -- what runs today is served, so 2025 has no gaps
+  LOCAL_STRESS         = DC_LOAD_MW / LOCAL_HEADROOM_MW      (> 1 = local gap)
+  DC_GAP_MW            = max(DC_LOAD_MW - LOCAL_HEADROOM_MW, 0)
 
   DC_LOAD_MW       existing data centres (point MW scaled to Databricks Active
-                   state totals -- the same scaling as the BA tier, so hexes
-                   sum to the BA loads) + IM3 2035 sites x PUE x ramp(y)
-  LOCAL_SUPPLY_MW  LOCAL_GEN_MW + TX_CAPACITY_MW
-    LOCAL_GEN_MW   EIA-860M units located in the hex and online in year y
-                   (operating/retired/committed-planned dates), plus the
-                   BA's build-rate top-up placed where that BA built in
-                   2021-2025 (new capacity sited like recent capacity)
-    TX_CAPACITY_MW HIFLD transmission lines >= MIN_LINE_KV (115 kV) CROSSING the
-                   hex boundary, each counted once and rated with the FERC-data
-                   voltage fit of Athari & Wang 2017 (LINE_RATING_FIT); static.
-                   Segments entirely inside a
-                   hex are left out -- HIFLD splits circuits at every
-                   substation, so summing internal segments counted a dense
-                   metro network many times over (52 GW for one Loudoun hex).
-                   Lines with unknown voltage are left out.
+                   state totals, as in the BA tier) + IM3 2035 sites x PUE x ramp(y)
+  GRID_STRENGTH_MW LOCAL_GEN_MW + TX_CAPACITY_MW -- used only as a *share*
+    LOCAL_GEN_MW   EIA-860M units in the hex online in year y, plus the BA's
+                   build-rate top-up placed where that BA built in 2021-2025
+    TX_CAPACITY_MW HIFLD lines >= MIN_LINE_KV (115 kV) CROSSING the hex boundary,
+                   each counted once, rated with the FERC-data voltage fit of
+                   Athari & Wang 2017 (LINE_RATING_FIT). Internal segments are
+                   left out (HIFLD splits circuits at every substation).
 
-No local non-data-centre load is subtracted (a team decision: no population
-data), so the index reads as "share of the high-voltage supply reachable in
-this hex that data centres would use". It ranks hexes against each other; 1.0
-is NOT a capacity gap the way it is for the BA index. A screening index, not a
-power-flow study.
+Hex shares add up to the BA's headroom, so the tiers agree: a BA can be fine
+overall while the hexes where data centres cluster run out.
 
-Hexes with at least MIN_DC_MW_FOR_HV of data-centre load but no >= 115 kV line
-and no generation get NO_HV_ACCESS = 1, LOCAL_STRESS = null and
-LOCAL_STRESS_CAPPED = LOCAL_STRESS_CAP. Sites under MIN_DC_MW_FOR_HV with no
->= 115 kV line are assumed to run off the distribution network and get 0.
-LOCAL_STRESS_CAPPED is the field to feed Emerging Hot Spot Analysis.
+Why shares rather than absolute local supply/demand (both were tested):
+  - gross line ratings as local supply count through-flows as local, so almost
+    nothing shows a gap (1 hex in 2035, even around Loudoun);
+  - spreading BA peak demand by Census population against grid-strength supply
+    marks nearly every city as short before any data centre (154 of 225), since
+    cities import and HIFLD misses dense urban networks.
+
+LOCAL_CLASS: no_dc | distribution_served (< MIN_DC_MW_FOR_HV, no HV line) |
+surplus | near_limit (>= 0.9) | gap (> 1, or new load where the BA has no
+headroom) | no_capacity_data | data_artifact (BA flagged in the BA tier).
+
+Hot spots: Getis-Ord Gi* on DC_GAP_MW each year across all CONUS hexes
+(GI_DISTANCE_M, FDR-corrected), standardized against the pooled 2025-2035
+mean and spread so years are comparable: GI_Z, GI_P, GI_BIN (-3..3, ArcGIS
+convention), GI_PATTERN per hex per year -- time-enabled for the slider.
+LOCAL_STRESS_CAPPED feeds Emerging Hot Spot Analysis (decade trend).
+
+A screening model, not a power-flow study.
 
 Writes to output/:
   us_hex_local_stress_2025_2035.csv   one row per hex per year (all CONUS hexes)
@@ -44,6 +53,7 @@ Writes to output/:
 """
 
 import json
+import math
 import zipfile
 
 import numpy as np
@@ -54,8 +64,10 @@ import shapely
 from pyproj import Transformer
 from shapely.geometry import shape as shapely_shape
 
+from sklearn.neighbors import BallTree
+
 from config import (
-    EIA_PLANNED_STATUSES, EXCLUDED_STATES, GROWTH_PUE, HEX_CRS, HEX_WIDTH_M,
+    GI_DISTANCE_M, GI_FDR, EIA_PLANNED_STATUSES, EXCLUDED_STATES, GROWTH_PUE, HEX_CRS, HEX_WIDTH_M,
     LINE_KV_VALID, LINE_RATING_FIT, LOCAL_STRESS_CAP, MIN_DC_MW_FOR_HV, MIN_LINE_KV, OUT_DIR, TIGER_STATES_ZIP,
     TRANSMISSION_ZIP, TREND_HISTORY_YEARS, TS_YEARS,
 )
@@ -227,13 +239,70 @@ def transmission_capacity(hexes, lines) -> tuple[np.ndarray, np.ndarray, np.ndar
 
 
 # ----------------------------------------------------------------------------
+# Local headroom
+# ----------------------------------------------------------------------------
+def allocate_ba_value(hexes, strength: np.ndarray, ba_value: pd.Series, year: int) -> np.ndarray:
+    """A BA-level MW value for the year, shared across the BA's hexes by grid strength.
+
+    Gross line ratings say where power can be delivered, not how much is spare
+    (through-flows are counted as if local), so they set the *share* only; the
+    amount comes from the BA tier, so hex values add up to the BA's. NaN where the
+    BA has no capacity data or the hex is outside every BA."""
+    ba = hexes["BA_NAME"].to_numpy()
+    df = pd.DataFrame({"ba": ba, "w": strength})
+    total_w = df.groupby("ba")["w"].transform("sum").to_numpy()
+    cap = np.array([ba_value.get((b, year), np.nan) if isinstance(b, str) else np.nan for b in ba])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(total_w > 0, cap * strength / total_w, np.nan)
+
+
+# ----------------------------------------------------------------------------
+# Hot spots (Getis-Ord Gi*)
+# ----------------------------------------------------------------------------
+class GiStar:
+    """Binary fixed-distance Gi* (self included), as in ArcGIS Hot Spot Analysis."""
+
+    def __init__(self, coords: np.ndarray, distance: float):
+        self.neighbors = BallTree(coords).query_radius(coords, r=distance)
+        self.wsum = np.array([len(nb) for nb in self.neighbors], dtype=float)
+        self.n = len(coords)
+
+    def __call__(self, x: np.ndarray, xbar: float, sd: float):
+        """xbar/sd are pooled over all years, so z-scores (and the hot spot extent)
+        are comparable from year to year rather than relative to each year alone."""
+        n = self.n
+        if sd == 0:
+            return np.zeros(n), np.ones(n), np.zeros(n, dtype=int)
+        lag = np.array([x[nb].sum() for nb in self.neighbors])
+        z = (lag - xbar * self.wsum) / (sd * np.sqrt((n * self.wsum - self.wsum ** 2) / (n - 1)))
+        p = np.array([math.erfc(abs(v) / math.sqrt(2)) for v in z])
+        bins = np.zeros(n, dtype=int)
+        for level, alpha in ((1, 0.10), (2, 0.05), (3, 0.01)):
+            cut = self.fdr_cutoff(p, alpha) if GI_FDR else alpha
+            bins[(p <= cut)] = level
+        return z, p, np.sign(z).astype(int) * bins
+
+    @staticmethod
+    def fdr_cutoff(p: np.ndarray, alpha: float) -> float:
+        ranked = np.sort(p)
+        ok = ranked <= alpha * np.arange(1, len(p) + 1) / len(p)
+        return ranked[np.nonzero(ok)[0].max()] if ok.any() else -1.0
+
+
+GI_LABELS = {3: "Hot Spot - 99% Confidence", 2: "Hot Spot - 95% Confidence", 1: "Hot Spot - 90% Confidence",
+             0: "Not Significant", -1: "Cold Spot - 90% Confidence", -2: "Cold Spot - 95% Confidence",
+             -3: "Cold Spot - 99% Confidence"}
+
+
+# ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
 def main():
     print("Building hex grid ...")
     names, geoms = conus_states()
     hexes = hex_grid(names, geoms)
-    hexes["BA_NAME"] = join_ba(hexes["lat"], hexes["lon"], load_control_areas())
+    control_areas = load_control_areas()
+    hexes["BA_NAME"] = join_ba(hexes["lat"], hexes["lon"], control_areas)
     print(f"  {len(hexes):,} hexes ({HEX_WIDTH_M / 1000:.0f} km across)")
 
     print("Demand ...")
@@ -247,30 +316,61 @@ def main():
     tx, n_lines, max_kv = transmission_capacity(hexes, lines)
     print(f"  {len(lines):,} lines >= {MIN_LINE_KV} kV; {(tx > 0).sum():,} hexes reach one")
     gen = local_generation(hexes)
+    gi = GiStar(shapely.get_coordinates(shapely.centroid(hexes["geometry"].to_numpy())), GI_DISTANCE_M)
 
     ba_ts = pd.read_csv(OUT_DIR / "us_ba_time_series_2025_2035.csv").set_index(["BA_NAME", "YEAR"])
+    ba_artifact = ba_ts["DATA_ARTIFACT_FLAG"].groupby(level=0).first()
 
     frames = []
     for year in TS_YEARS:
         load = dc_existing + dc_new * ramp(year)
-        supply = gen[year] + tx
-        # small sites with no HV line are distribution-served: not a pressure point
-        distribution = (load > 0) & (load < MIN_DC_MW_FOR_HV) & (tx <= 0)
-        no_access = (load >= MIN_DC_MW_FOR_HV) & (supply <= 0)
+        strength = gen[year] + tx
+        share_mw = allocate_ba_value(hexes, strength, ba_ts["AVAIL_CAP_MW"], year)
+        no_cap = np.isnan(share_mw)
+        # what runs today is served (the lights are on), so a hex's headroom is at
+        # least its existing data-centre load
+        headroom = np.where(no_cap, np.nan, np.maximum(np.nan_to_num(share_mw), dc_existing))
+        has_dc = load > 0
+        distribution = has_dc & (load < MIN_DC_MW_FOR_HV) & (tx <= 0)
+        assessed = has_dc & ~distribution & ~no_cap
         with np.errstate(divide="ignore", invalid="ignore"):
-            stress = np.where((load > 0) & ~distribution & ~no_access, load / supply, 0.0)
-        stress[no_access] = np.nan
-        capped = np.where(no_access, LOCAL_STRESS_CAP, np.minimum(np.nan_to_num(stress), LOCAL_STRESS_CAP))
+            stress = np.where(assessed & (headroom > 0), load / headroom, 0.0)
+        stress[assessed & (headroom <= 0)] = np.nan            # new load where the BA has no headroom
+        gap = np.where(assessed, np.maximum(load - np.nan_to_num(headroom), 0.0), 0.0)
+        capped = np.where(np.isnan(stress), LOCAL_STRESS_CAP, np.minimum(stress, LOCAL_STRESS_CAP))
+        artifact = hexes["BA_NAME"].map(ba_artifact).fillna(False).to_numpy(dtype=bool)
+        cls = np.select(
+            [~has_dc, distribution, no_cap, artifact, np.isnan(stress) | (stress > 1), stress >= 0.9],
+            ["no_dc", "distribution_served", "no_capacity_data", "data_artifact", "gap", "near_limit"], "surplus")
+        gap[artifact] = 0.0
+        stress = np.where(artifact, np.nan, stress)
+        capped[artifact | ~assessed] = 0.0
         ba_stress = [ba_ts["STRESS_INDEX"].get((b, year), np.nan) if b else np.nan for b in hexes["BA_NAME"]]
         frames.append(pd.DataFrame({
             "HEX_ID": hexes["HEX_ID"], "YEAR": year, "YEAR_DATE": f"{year}-01-01",
             "STATE": hexes["STATE"], "BA_NAME": hexes["BA_NAME"],
-            "DC_LOAD_MW": load, "DC_EXISTING_MW": dc_existing, "DC_NEW_MW": dc_new * ramp(year),
-            "LOCAL_GEN_MW": gen[year], "TX_CAPACITY_MW": tx, "LOCAL_SUPPLY_MW": supply,
-            "LOCAL_STRESS": stress, "LOCAL_STRESS_CAPPED": capped,
-            "NO_HV_ACCESS": no_access.astype(int), "BA_STRESS_INDEX": ba_stress,
+            "DC_LOAD_MW": load, "LOCAL_HEADROOM_MW": headroom, "LOCAL_STRESS": stress, "DC_GAP_MW": gap,
+            "LOCAL_CLASS": cls,
+            "LOCAL_STRESS_CAPPED": capped, "DATA_ARTIFACT_FLAG": artifact.astype(int),
+            "DC_EXISTING_MW": dc_existing, "DC_NEW_MW": dc_new * ramp(year),
+            "GRID_STRENGTH_MW": strength, "LOCAL_GEN_MW": gen[year], "TX_CAPACITY_MW": tx,
+            "BA_HEADROOM_SHARE_MW": share_mw, "BA_STRESS_INDEX": ba_stress,
         }))
     ts = pd.concat(frames, ignore_index=True)
+
+    print("Hot spots of capacity gaps (Gi*, pooled across years) ...")
+    pooled = ts["DC_GAP_MW"].to_numpy()
+    xbar, sd = pooled.mean(), pooled.std()
+    gi_cols = {"GI_Z": [], "GI_P": [], "GI_BIN": [], "GI_PATTERN": []}
+    for year in TS_YEARS:
+        z, p, gi_bin = gi(ts.loc[ts["YEAR"] == year, "DC_GAP_MW"].to_numpy(), xbar, sd)
+        gi_cols["GI_Z"].append(z), gi_cols["GI_P"].append(p), gi_cols["GI_BIN"].append(gi_bin)
+        gi_cols["GI_PATTERN"].append(np.array([GI_LABELS[b] for b in gi_bin], dtype=object))
+    for col, parts in gi_cols.items():
+        ts[col] = np.concatenate(parts)          # frames were built year by year, in TS_YEARS order
+    order = ["HEX_ID", "YEAR", "YEAR_DATE", "STATE", "BA_NAME", "DC_LOAD_MW", "LOCAL_HEADROOM_MW",
+             "LOCAL_STRESS", "DC_GAP_MW", "LOCAL_CLASS", "GI_Z", "GI_P", "GI_BIN", "GI_PATTERN"]
+    ts = ts[order + [c for c in ts.columns if c not in order]]
     ts.to_csv(OUT_DIR / "us_hex_local_stress_2025_2035.csv", index=False, float_format="%.4f")
 
     wgs = shapely.transform(hexes["geometry"].to_numpy(),
@@ -286,12 +386,17 @@ def main():
     print(f"Wrote us_hex_local_stress_2025_2035.csv ({len(ts):,} rows) and us_hex_grid.geojson")
 
     for year in (TS_YEARS[0], TS_YEARS[-1]):
-        y = ts[(ts["YEAR"] == year) & (ts["DC_LOAD_MW"] > 0)]
-        print(f"\n{year}: {len(y)} hexes with data-centre load; {int(y['NO_HV_ACCESS'].sum())} without HV access; "
-              f"{int((y['LOCAL_STRESS'] > 1).sum())} over 1.0")
-        print(y.sort_values("LOCAL_STRESS_CAPPED", ascending=False).head(10)
-              [["HEX_ID", "STATE", "BA_NAME", "DC_LOAD_MW", "LOCAL_SUPPLY_MW", "LOCAL_STRESS"]]
-              .to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
+        y = ts[ts["YEAR"] == year]
+        dc = y[y["DC_LOAD_MW"] > 0]
+        print(f"\n{year}: classes of hexes with data-centre load: {dc['LOCAL_CLASS'].value_counts().to_dict()}")
+        print(f"  DC gap {y['DC_GAP_MW'].sum():,.0f} MW in {(y['DC_GAP_MW'] > 0).sum()} hexes; "
+              f"Gi* hot spot hexes (99/95/90%): {[(y['GI_BIN'] == b).sum() for b in (3, 2, 1)]}")
+        hot = y[y["GI_BIN"] > 0]
+        if len(hot):
+            print("  hot spot hexes by state:", hot["STATE"].value_counts().head(8).to_dict())
+        print(dc.sort_values("DC_GAP_MW", ascending=False).head(8)
+              [["HEX_ID", "STATE", "BA_NAME", "DC_EXISTING_MW", "DC_LOAD_MW", "LOCAL_HEADROOM_MW",
+                "DC_GAP_MW", "LOCAL_CLASS"]].to_string(index=False, float_format=lambda v: f"{v:,.0f}"))
 
 
 if __name__ == "__main__":
