@@ -98,7 +98,7 @@ def conus_states():
     return names, np.array(geoms)
 
 
-def hex_grid(state_names, state_geoms) -> pd.DataFrame:
+def hex_grid(state_names, state_geoms, to_wgs=TO_WGS) -> pd.DataFrame:
     """Flat-topped hexagons covering CONUS, kept where they touch a state."""
     side = HEX_WIDTH_M / np.sqrt(3)
     xmin, ymin, xmax, ymax = shapely.total_bounds(state_geoms)
@@ -126,14 +126,14 @@ def hex_grid(state_names, state_geoms) -> pd.DataFrame:
     missing = np.where(state == None)[0]  # noqa: E711
     state[missing] = np.array(state_names, dtype=object)[first.loc[keep[missing]].to_numpy()]
 
-    lon, lat = TO_WGS.transform(centers[:, 0], centers[:, 1])
+    lon, lat = to_wgs.transform(centers[:, 0], centers[:, 1])
     return pd.DataFrame({"HEX_ID": [f"H{i:05d}" for i in range(len(hexes))], "geometry": hexes,
                          "STATE": state, "lon": lon, "lat": lat})
 
 
-def assign_to_hex(lons, lats, hexes: pd.DataFrame) -> np.ndarray:
+def assign_to_hex(lons, lats, hexes: pd.DataFrame, to_hex=TO_HEX) -> np.ndarray:
     """Hex index for each lon/lat point, or -1."""
-    x, y = TO_HEX.transform(np.asarray(lons, float), np.asarray(lats, float))
+    x, y = to_hex.transform(np.asarray(lons, float), np.asarray(lats, float))
     pts = shapely.points(x, y)
     p_idx, h_idx = shapely.STRtree(hexes["geometry"].to_numpy()).query(pts, predicate="intersects")
     out = np.full(len(pts), -1)

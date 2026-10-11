@@ -98,10 +98,11 @@ def invariants() -> bool:
     ok = all([
         _check("VisionQuest footprint MW ~0.42", vq["mw_estimate"].iloc[0] if len(vq) else None, 0.42, 0.02),
         _check("VisionQuest lat (Charlottetown)", vq["lat"].iloc[0] if len(vq) else None, 46.2372, 0.001),
-        _check("Ontario DC growth 2025->2035 x1.854",
-               ca.loc["Ontario", "dc_load_2035_mw"] / ca.loc["Ontario", "dc_load_2025_mw"], 1.854, 0.001),
-        _check("Ontario headroom change -46.8%", head.loc["Ontario", "headroom_change_pct"], -46.8, 0.1),
-        _check("Nova Scotia headroom change +395.5%", head.loc["Nova Scotia", "headroom_change_pct"], 395.5, 0.1),
+        _check("Ontario CER capacity 2025 (MW)", head.loc["Ontario", "total_cap_2025_mw"], 44563.8, 0.1),
+        _check("Ontario CER capacity 2035 (MW)", head.loc["Ontario", "total_cap_2035_mw"], 48357.1, 0.1),
+        _check("Ontario DC 2025 = IESO floor 293 + 70 new", ca.loc["Ontario", "dc_load_2025_mw"], 363, 0.5),
+        _check("Ontario DC 2035 = 293 + IESO 1,070 new", ca.loc["Ontario", "dc_load_2035_mw"], 1363, 0.5),
+        _check("Alberta DC 2035 includes AESO 1,200 MW", ca.loc["Alberta", "dc_load_2035_mw"] - 1200, 10.8, 0.5),
         _check("bad geocodes flagged = 13", len(flagged), 13, 0),
     ])
     return ok
@@ -184,6 +185,24 @@ def legacy_benchmarks():
         print(f"  {name:<40} handoff {handoff:<6} now {ba.get(name, np.nan):.3f}")
 
 
+def canada_local_checks() -> bool:
+    """The Canadian hex tier must add up to the provincial series."""
+    hx = read(OUT_DIR / "ca_hex_local_stress_2025_2035.csv")
+    pr = read(OUT_DIR / "canada_stress_index_timeseries.csv")
+    print("\n=== Canadian hex tier ===")
+    ok = []
+    for year in (2025, 2035):
+        h = hx.loc[hx["YEAR"] == year, "DC_LOAD_MW"].sum()
+        b = pr.loc[pr["year"] == year, "dc_load_mw"].sum()
+        good = abs(h - b) < 1.0
+        ok.append(good)
+        print(f"  [{'PASS' if good else 'FAIL'}] {year} hex DC load {h:,.0f} MW vs provinces {b:,.0f} MW")
+    no_gap = hx.loc[hx["YEAR"] == 2025, "DC_GAP_MW"].sum() == 0
+    ok.append(no_gap)
+    print(f"  [{'PASS' if no_gap else 'FAIL'}] no local gaps in 2025")
+    return all(ok)
+
+
 def main():
     print("=== output/ vs reference_outputs/ ===")
     for name, key in KEYED_FILES.items():
@@ -191,7 +210,7 @@ def main():
     for name in COUNT_FILES:
         compare_counts(name)
     legacy_benchmarks()
-    ok = invariants() & time_series_checks() & local_checks()
+    ok = invariants() & time_series_checks() & local_checks() & canada_local_checks()
     return 0 if ok else 1
 
 

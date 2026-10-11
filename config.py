@@ -77,7 +77,7 @@ GEOCODE_FIXES = [
 CANADA_PEAK_LOAD_2025_MW = {
     "Ontario": 25_600,
     "Quebec": 40_000,
-    "Alberta": 12_200,
+    "Alberta": 12_785,          # record peak, Dec 11 2025 (alberta.ca/datacentres/numbers); was 12,200
     "British Columbia": 10_500,
     "New Brunswick": 3_200,
     "Nova Scotia": 2_300,
@@ -99,6 +99,62 @@ IESO_DC_TWH_2026 = 3.0
 IESO_DC_CAGR = 0.071
 IESO_BASE_YEAR = 2026
 HOURS_PER_YEAR = 8760
+
+# ----------------------------------------------------------------------------
+# Canadian data-centre demand (canada_stress.py, canada_local_stress.py)
+# Building footprints alone gave 434 MW for all of Canada, with no control
+# total. These utility/system-operator figures replace them where they exist.
+# ----------------------------------------------------------------------------
+# 2025 existing load floors (MW). Province load = max(footprint sum, floor).
+CANADA_DC_EXISTING_FLOOR_MW = {
+    # IESO, Large Step Loads technical paper (Jul 2025): "Toronto alone was home
+    # to 293 MW of data centres" (Sept 2023) -- a floor for Ontario as a whole
+    "Ontario": 293,
+    # Hydro-Quebec: data centres subject to the proposed CD rate (>= 5 MW)
+    # "currently consume 190 MW at peak"
+    "Quebec": 190,
+}
+# New data-centre load on top of the existing floor, MW by year (reference).
+CANADA_DC_NEW_REF_MW = {
+    # IESO Large Step Loads paper, Fig. 5: data-centre project load included in
+    # the 2025 APO (likelihood-weighted), read from the chart (~+/-20 MW)
+    "Ontario": {2025: 70, 2026: 140, 2027: 320, 2028: 405, 2029: 540, 2030: 640,
+                2031: 705, 2032: 785, 2033: 815, 2034: 825, 2035: 1070},
+    # Hydro-Quebec: could reach 1,000 MW by 2035 -> linear from 190 MW in 2025
+    "Quebec": {y: round((1000 - 190) * (y - 2025) / 10) for y in range(2025, 2036)},
+    # AESO Phase I: 1,200 MW for in-service 2027-2028 (Meta, Sturgeon County,
+    # 970 MW; TransAlta Keephills, Parkland County, 230 MW); held flat after
+    "Alberta": {y: (0 if y < 2027 else 485 if y == 2027 else 1200) for y in range(2025, 2036)},
+    # BC Energy Statutes Amendment Act 2025: caps of 400 MW (Feb 2026-Feb 2028)
+    # and 200 MW (Feb 2028-Feb 2029) for new data-centre capacity, assumed taken
+    # up in full; held flat after
+    "British Columbia": {y: (0 if y < 2027 else 200 if y == 2027 else 400 if y == 2028 else 600)
+                         for y in range(2025, 2036)},
+}
+# High case: every proposed project / request, MW by year.
+CANADA_DC_NEW_HIGH_MW = {
+    # IESO paper Fig. 4: all proposed data-centre load, tiers 1-3
+    "Ontario": {2025: 100, 2026: 240, 2027: 500, 2028: 750, 2029: 1180, 2030: 1640,
+                2031: 2200, 2032: 2650, 2033: 3100, 2034: 3550, 2035: 4400},
+    # Hydro-Quebec: ~2,500 MW of data-centre block requests under government
+    # review (Les Affaires, 2026), assumed phased in linearly by 2030
+    "Quebec": {y: round(190 + min(1.0, max(0, y - 2025) / 5) * 2500) - 190 for y in range(2025, 2036)},
+    # AESO: 4,800 MW qualified in Phase I (15 projects), phased in 2027-2030
+    "Alberta": {y: round(4800 * min(1.0, max(0, y - 2026) / 4)) for y in range(2025, 2036)},
+    "British Columbia": None,   # legislated caps -> same as reference
+}
+# Named projects with a known site; the rest of a province's new load goes to
+# its existing data-centre points in proportion to their MW. Coordinates are
+# approximate (municipality / site level).
+CANADA_DC_SITES = [
+    {"name": "Meta campus (Industrial Heartland)", "province": "Alberta", "lat": 53.80, "lon": -113.25,
+     "share_of_new": 970 / 1200},
+    {"name": "TransAlta Keephills", "province": "Alberta", "lat": 53.45, "lon": -114.45,
+     "share_of_new": 230 / 1200},
+]
+NACEI_PLANT_FILES = [DATA_DIR / "nacei_plants_layer15.geojson", DATA_DIR / "nacei_plants_layer28.geojson"]
+OSM_LINES_DIR = DATA_DIR / "osm_power_lines"
+CA_HEX_CRS = "ESRI:102001"      # Canada Albers Equal Area
 
 
 # ----------------------------------------------------------------------------

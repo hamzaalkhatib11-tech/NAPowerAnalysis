@@ -12,6 +12,10 @@ time-enabled layers to output/gis/:
     us_hex_local_stress_timeseries 15,431 hexes x 2025-2035 (local_stress.py); feed
                                    LOCAL_STRESS_CAPPED to Emerging Hot Spot Analysis
     transmission_115kv_plus        HIFLD lines >= 115 kV with the MW rating used
+    ca_hex_local_stress_timeseries Canadian hexes x 2025-2035 (canada_local_stress.py),
+                                   same fields as the U.S. hex layer, PROVINCE for BA
+    ca_transmission_osm_115kv_plus OpenStreetMap lines >= 115 kV (c) OpenStreetMap
+                                   contributors, ODbL -- credit on the map
   us_ba_stress_timeseries.geojson / ca_province_stress_timeseries.geojson
                                    same time layers for a direct ArcGIS Online upload
                                    (set YEAR_DATE as the time field; it is ISO text there)
@@ -42,6 +46,7 @@ from config import (
 from geo import read_prj, read_prj_from_zip
 from config import HEX_CRS
 from local_stress import load_hv_lines
+from canada_local_stress import TO_WGS as CA_TO_WGS, load_osm_lines
 
 GDB = GIS_DIR / "ggr442_grid_stress.gdb"
 WGS84 = "EPSG:4326"
@@ -122,6 +127,11 @@ def canada_table() -> pd.DataFrame:
         "DATA_ARTIFACT_FLAG": False,
         "ARTIFACT_REASON": "",
         "DC_GROWTH_SOURCE": ca["dc_growth_source"],
+        "SYSTEM_PEAK_MW": ca["system_peak_mw"],
+        "DC_EXISTING_MW": ca["dc_existing_mw"],
+        "DC_NEW_MW": ca["dc_new_mw"],
+        "DC_LOAD_HIGH_MW": ca["dc_load_high_mw"],
+        "STRESS_INDEX_HIGH": ca["stress_index_high"],
     })
 
 
@@ -215,6 +225,22 @@ def main():
     write_layer(lines[["kv", "rating_mw", "VOLT_CLASS", "STATUS", "OWNER", "geometry"]]
                 .rename(columns={"kv": "VOLTAGE_KV", "rating_mw": "RATING_MW"}),
                 "transmission_115kv_plus", "MultiLineString")
+
+    print("Canadian hex layers ...")
+    with open(OUT_DIR / "ca_hex_grid.geojson", encoding="utf-8") as f:
+        ca_feats = json.load(f)["features"]
+    ca_geom = pd.DataFrame({"HEX_ID": [ft["properties"]["HEX_ID"] for ft in ca_feats],
+                            "geometry": [shapely_shape(ft["geometry"]) for ft in ca_feats]})
+    cx = pd.read_csv(OUT_DIR / "ca_hex_local_stress_2025_2035.csv").merge(ca_geom, on="HEX_ID", how="left")
+    assert cx["geometry"].notna().all(), "Canadian hex polygon missing"
+    write_layer(cx, "ca_hex_local_stress_timeseries", "Polygon")
+
+    osm = load_osm_lines()
+    osm["geometry"] = shapely.transform(shapely.simplify(osm["geometry"].to_numpy(), 100.0),
+                                        lambda xy: np.column_stack(CA_TO_WGS.transform(xy[:, 0], xy[:, 1])))
+    write_layer(osm[["osm_id", "kv", "rating_mw", "geometry"]]
+                .rename(columns={"osm_id": "OSM_ID", "kv": "VOLTAGE_KV", "rating_mw": "RATING_MW"}),
+                "ca_transmission_osm_115kv_plus", "MultiLineString")
 
     # zip the .gdb so it can be uploaded to ArcGIS Online as a single file
     archive = shutil.make_archive(str(GIS_DIR / "ggr442_grid_stress.gdb"), "zip", GIS_DIR, GDB.name)
