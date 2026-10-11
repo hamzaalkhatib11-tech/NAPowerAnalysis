@@ -1,9 +1,9 @@
 """
 canada_local_stress.py
 
-Local capacity gaps and yearly hot spots on a ~25 km hexagon grid for the six
-provinces with a provincial stress series (ON, QC, AB, BC, NB, NS), 2025-2035.
-Same method as local_stress.py (U.S.), with Canadian inputs:
+Local capacity gaps and yearly hot spots on a ~25 km hexagon grid for the nine
+provinces with a provincial stress series (ON, QC, AB, BC, MB, SK, NB, NS, NL),
+2025-2035. Same method as local_stress.py (U.S.), with Canadian inputs:
 
   PROVINCE headroom  AVAIL_CAP_MW from canada_stress.py (CER capacity - baseline
                      peak), shared across the province's hexes by grid strength
@@ -13,26 +13,28 @@ Same method as local_stress.py (U.S.), with Canadian inputs:
   Gi* hot spots      on DC_GAP_MW, pooled across years (as in the U.S. tier)
 
   DC_LOAD_MW         existing points (building-footprint MW, scaled up to the
-                     provincial floor where one exists) + new load from
-                     canada_stress.py's reference path, placed at named sites
-                     (Alberta's Meta and Keephills projects) or, otherwise, at
-                     the province's existing data-centre points in proportion
-                     to their MW
+                     provincial floor where one exists) + each province's new
+                     load from canada_stress.py (dc_new_mw), placed at named
+                     sites (Alberta's Meta and Keephills projects) and otherwise
+                     by the siting model below
   GRID_STRENGTH_MW   NRCan NACEI power plants (>= 100 MW, and renewables >= 1 MW;
                      static, 2013-2021 vintage) + OpenStreetMap lines >= 115 kV
                      crossing the hex boundary, rated with the same FERC-data
                      voltage fit as the U.S. (Athari & Wang 2017)
 
-Coverage notes: Nova Scotia has no OSM line data (the Overpass server refused
-the download), so its grid strength is plants only (OSM_LINES = 0). No Canadian
-equivalent of IM3 exists, so new load follows announced sites or today's
-clusters rather than modelled new sites.
+Siting model (stand-in for IM3, which covers only the U.S.): eligible hexes
+hold an OSM substation >= 115 kV; SITING_SCORE = CA_SITING_GRAVITY_WEIGHT x
+market gravity (population of OSM cities/towns within 100 km) + the rest x grid
+strength, each log-scaled to 0-1 within the province. A province's unsited new
+load goes to its CA_SITING_TOP_K best hexes in proportion to score.
+
+Newfoundland and Labrador is flagged as a data artifact (CER capacity includes
+Churchill Falls output contracted to Hydro-Quebec).
 
 Writes to output/:
   ca_hex_local_stress_2025_2035.csv   one row per hex per year
   ca_hex_grid.geojson                 hex polygons (WGS84) + static attributes
 """
-
 import json
 import re
 
@@ -42,8 +44,11 @@ import shapefile
 import shapely
 from pyproj import Transformer
 
+from sklearn.neighbors import BallTree
+
 from config import (
-    CA_HEX_CRS, CANADA_DC_EXISTING_FLOOR_MW, CANADA_DC_NEW_REF_MW, CANADA_DC_SITES,
+    CA_HEX_CRS, CA_SITING_GRAVITY_RADIUS_M, CA_SITING_GRAVITY_WEIGHT, CA_SITING_TOP_K,
+    CANADA_ARTIFACT_PROVINCES, CANADA_DC_EXISTING_FLOOR_MW, CANADA_DC_SITES, PROVINCE_ABBREV,
     CANADA_PEAK_LOAD_2025_MW, GI_DISTANCE_M, LOCAL_STRESS_CAP, MIN_DC_MW_FOR_HV, MIN_LINE_KV,
     NACEI_PLANT_FILES, OSM_LINES_DIR, OUT_DIR, STATCAN_PROVINCES_ZIP, TS_YEARS,
 )
@@ -91,8 +96,12 @@ def dc_points() -> pd.DataFrame:
     return pts
 
 
-def demand(hexes, pts) -> tuple[np.ndarray, dict]:
-    """Existing MW per hex, and {year: new MW per hex}."""
+def demand(hexes, pts, prov_ts: pd.DataFrame, siting_weights: dict) -> tuple[np.ndarray, dict]:
+    """Existing MW per hex, and {year: new MW per hex}.
+
+    New MW per province comes from canada_stress.py (one source of truth); named
+    sites take their share, the rest goes to the province's siting-model hexes
+    (or, if a province has none, to its existing data-centre points)."""
     idx = assign_to_hex(pts["lon"], pts["lat"], hexes, TO_HEX)
     ok = idx >= 0
     existing = np.bincount(idx[ok], weights=pts["mw"].to_numpy()[ok], minlength=len(hexes))
@@ -102,22 +111,94 @@ def demand(hexes, pts) -> tuple[np.ndarray, dict]:
     new = {}
     for year in TS_YEARS:
         arr = np.zeros(len(hexes))
-        for prov, table in CANADA_DC_NEW_REF_MW.items():
-            mw = float(table.get(year, 0.0))
+        for prov in PROVINCES:
+            mw = float(prov_ts["dc_new_mw"].get((prov, year), 0.0))
             if mw <= 0:
                 continue
+            in_prov_sites = (sites["province"] == prov).to_numpy()
             placed = 0.0
-            for (_, site), h in zip(sites[sites["province"] == prov].iterrows(),
-                                    site_idx[(sites["province"] == prov).to_numpy()]):
-                arr[h] += mw * site["share_of_new"]
-                placed += site["share_of_new"]
+            for share, h in zip(sites.loc[in_prov_sites, "share_of_new"], site_idx[in_prov_sites]):
+                arr[h] += mw * share
+                placed += share
             rest = mw * (1 - placed)
-            in_prov = ok & (pts["joined_province"] == prov).to_numpy()
-            w = pts["mw"].to_numpy()[in_prov]
-            if rest > 0 and w.sum() > 0:
-                arr += np.bincount(idx[in_prov], weights=rest * w / w.sum(), minlength=len(hexes))
+            if rest <= 0:
+                continue
+            if prov in siting_weights:
+                hexes_w = siting_weights[prov]
+                arr[hexes_w.index.to_numpy()] += rest * hexes_w.to_numpy()
+            else:
+                in_prov = ok & (pts["joined_province"] == prov).to_numpy()
+                w = pts["mw"].to_numpy()[in_prov]
+                if w.sum() > 0:
+                    arr += np.bincount(idx[in_prov], weights=rest * w / w.sum(), minlength=len(hexes))
         new[year] = arr
     return existing, new
+
+
+# ----------------------------------------------------------------------------
+# Siting model (stand-in for IM3)
+# ----------------------------------------------------------------------------
+def load_substations(hexes) -> np.ndarray:
+    """Count of OSM substations >= MIN_LINE_KV per hex."""
+    lons, lats = [], []
+    for path in sorted(OSM_LINES_DIR.glob("subs-CA-*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                elements = json.load(f).get("elements", [])
+        except (json.JSONDecodeError, OSError):
+            print(f"  WARNING: {path.name} unreadable -- skipped")
+            continue
+        for e in elements:
+            if osm_kv(e.get("tags", {}).get("voltage")) < MIN_LINE_KV:
+                continue
+            pt = e.get("center") or e
+            if "lat" in pt:
+                lons.append(pt["lon"]), lats.append(pt["lat"])
+    idx = assign_to_hex(lons, lats, hexes, TO_HEX)
+    print(f"  {len(lons):,} OSM substations >= {MIN_LINE_KV} kV")
+    return np.bincount(idx[idx >= 0], minlength=len(hexes))
+
+
+def market_gravity(hexes) -> np.ndarray:
+    """Population of OSM cities/towns within CA_SITING_GRAVITY_RADIUS_M of each hex centre."""
+    with open(OSM_LINES_DIR / "places-CA.json", encoding="utf-8") as f:
+        places = json.load(f).get("elements", [])
+    pop = []
+    for e in places:
+        digits = re.sub(r"[^0-9]", "", str(e.get("tags", {}).get("population", "")))
+        if digits and "lat" in e:
+            pop.append((e["lon"], e["lat"], float(digits)))
+    pop = np.array(pop)
+    x, y = TO_HEX.transform(pop[:, 0], pop[:, 1])
+    tree = BallTree(np.column_stack([x, y]))
+    centres = shapely.get_coordinates(shapely.centroid(hexes["geometry"].to_numpy()))
+    neighbours = tree.query_radius(centres, r=CA_SITING_GRAVITY_RADIUS_M)
+    print(f"  {len(pop):,} OSM cities/towns with population ({pop[:, 2].sum() / 1e6:.1f} M people)")
+    return np.array([pop[nb, 2].sum() for nb in neighbours])
+
+
+def siting_model(hexes, strength, substations, gravity) -> tuple[np.ndarray, dict]:
+    """SITING_SCORE per hex (0 where ineligible) and {province: weights over its top-K hexes}."""
+    score = np.zeros(len(hexes))
+    weights = {}
+    prov = hexes["PROVINCE"].to_numpy()
+
+    def scaled(v):
+        v = np.log1p(v)
+        span = v.max() - v.min()
+        return (v - v.min()) / span if span > 0 else np.zeros_like(v)
+
+    for p in PROVINCES:
+        eligible = np.where((prov == p) & (substations > 0))[0]
+        if len(eligible) == 0:
+            continue
+        sc = (CA_SITING_GRAVITY_WEIGHT * scaled(gravity[eligible])
+              + (1 - CA_SITING_GRAVITY_WEIGHT) * scaled(strength[eligible]))
+        score[eligible] = sc
+        top = eligible[np.argsort(-sc)[:CA_SITING_TOP_K]]
+        w = score[top] / score[top].sum() if score[top].sum() > 0 else np.full(len(top), 1 / len(top))
+        weights[p] = pd.Series(w, index=top)
+    return score, weights
 
 
 # ----------------------------------------------------------------------------
@@ -181,11 +262,6 @@ def main():
     hexes["HEX_ID"] = hexes["HEX_ID"].str.replace("H", "C", n=1)
     print(f"  {len(hexes):,} hexes across {len(names)} provinces")
 
-    print("Demand ...")
-    pts = dc_points()
-    existing, new = demand(hexes, pts)
-    print(f"  existing {existing.sum():,.0f} MW; new by 2035 {new[TS_YEARS[-1]].sum():,.0f} MW")
-
     print("Supply ...")
     plants = plant_capacity(hexes)
     lines = load_osm_lines()
@@ -193,7 +269,19 @@ def main():
     print(f"  {len(lines):,} OSM lines >= {MIN_LINE_KV} kV; {(tx > 0).sum():,} hexes reach one")
     strength = plants + tx
 
+    print("Siting model ...")
+    substations = load_substations(hexes)
+    gravity = market_gravity(hexes)
+    siting_score, siting_weights = siting_model(hexes, strength, substations, gravity)
+    for p, w in siting_weights.items():
+        print(f"  {p}: top sites {hexes.loc[w.index[:3], 'HEX_ID'].tolist()}")
+
+    print("Demand ...")
     prov_ts = pd.read_csv(OUT_DIR / "canada_stress_index_timeseries.csv").set_index(["province", "year"])
+    pts = dc_points()
+    existing, new = demand(hexes, pts, prov_ts, siting_weights)
+    print(f"  existing {existing.sum():,.0f} MW; new by 2035 {new[TS_YEARS[-1]].sum():,.0f} MW")
+    with_lines = {p for p in PROVINCES if (OSM_LINES_DIR / f"CA-{PROVINCE_ABBREV[p]}.json").exists()}
     prov = hexes["PROVINCE"].to_numpy()
     total_w = pd.Series(strength).groupby(prov).transform("sum").to_numpy()
     share = np.where(total_w > 0, strength / total_w, 0.0)
@@ -214,8 +302,11 @@ def main():
         gap = np.where(assessed, np.maximum(load - headroom, 0.0), 0.0)
         capped = np.where(np.isnan(stress), LOCAL_STRESS_CAP, np.minimum(stress, LOCAL_STRESS_CAP))
         capped[~assessed] = 0.0
-        cls = np.select([~has_dc, distribution, np.isnan(stress) | (stress > 1), stress >= 0.9],
-                        ["no_dc", "distribution_served", "gap", "near_limit"], "surplus")
+        artifact = np.isin(prov, list(CANADA_ARTIFACT_PROVINCES))
+        cls = np.select([~has_dc, distribution, artifact, np.isnan(stress) | (stress > 1), stress >= 0.9],
+                        ["no_dc", "distribution_served", "data_artifact", "gap", "near_limit"], "surplus")
+        gap[artifact] = 0.0
+        capped[artifact] = 0.0
         prov_stress = np.array([prov_ts["stress_index"].get((p, year), np.nan) for p in prov])
         frames.append(pd.DataFrame({
             "HEX_ID": hexes["HEX_ID"], "YEAR": year, "YEAR_DATE": f"{year}-01-01", "PROVINCE": prov,
@@ -224,7 +315,9 @@ def main():
             "DC_EXISTING_MW": existing, "DC_NEW_MW": new[year],
             "GRID_STRENGTH_MW": strength, "PLANT_MW": plants, "TX_CAPACITY_MW": tx,
             "PROVINCE_HEADROOM_SHARE_MW": share_mw, "PROVINCE_STRESS_INDEX": prov_stress,
-            "OSM_LINES": (prov != "Nova Scotia").astype(int),
+            "OSM_LINES": np.isin(prov, list(with_lines)).astype(int),
+            "DATA_ARTIFACT_FLAG": artifact.astype(int),
+            "SITING_SCORE": siting_score, "HV_SUBSTATIONS": substations, "POP_100KM": gravity,
         }))
     ts = pd.concat(frames, ignore_index=True)
 

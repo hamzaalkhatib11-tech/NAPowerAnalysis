@@ -122,10 +122,11 @@ def canada_table() -> pd.DataFrame:
         "PEAK_LOAD_MW": ca["peak_load_mw"],
         "AVAIL_CAP_MW": ca["avail_cap_mw"],
         "STRESS_INDEX": ca["stress_index"],
-        "STRESS_CLASS": np.where(ca["stress_index"] > 1, "gap",
-                                 np.where(ca["stress_index"] >= 0.9, "near_limit", "surplus")),
-        "DATA_ARTIFACT_FLAG": False,
-        "ARTIFACT_REASON": "",
+        "STRESS_CLASS": np.where(ca["data_artifact_flag"], "data_artifact",
+                                 np.where(ca["stress_index"] > 1, "gap",
+                                          np.where(ca["stress_index"] >= 0.9, "near_limit", "surplus"))),
+        "DATA_ARTIFACT_FLAG": ca["data_artifact_flag"].astype(bool),
+        "ARTIFACT_REASON": ca["artifact_reason"].fillna(""),
         "DC_GROWTH_SOURCE": ca["dc_growth_source"],
         "SYSTEM_PEAK_MW": ca["system_peak_mw"],
         "DC_EXISTING_MW": ca["dc_existing_mw"],
@@ -173,6 +174,11 @@ def write_layer(df: pd.DataFrame, layer: str, geometry_type: str, geojson: bool 
 def main():
     GIS_DIR.mkdir(parents=True, exist_ok=True)
     if GDB.exists():
+        # check for a lock before deleting anything, so a failed run can't leave a half-deleted .gdb
+        locks = list(GDB.glob("*.lock"))
+        if locks:
+            raise SystemExit(f"{GDB.name} is open in ArcGIS (lock files: {', '.join(l.name for l in locks[:3])}). "
+                             "Close the project or remove its layers from the map, then re-run export_gis.py.")
         shutil.rmtree(GDB)
 
     print("Building polygons ...")

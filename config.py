@@ -81,6 +81,15 @@ CANADA_PEAK_LOAD_2025_MW = {
     "British Columbia": 10_500,
     "New Brunswick": 3_200,
     "Nova Scotia": 2_300,
+    "Manitoba": 5_111,          # all-time record, Jan 2025 (Manitoba Hydro, via CBC)
+    "Saskatchewan": 3_910,      # annual net peak, SaskPower Annual Report 2025-26
+    "Newfoundland and Labrador": 1_765,   # Island system, winter 2023/24 (NL Hydro)
+}
+# Provinces whose stress values reflect data definitions rather than grid
+# conditions (kept on the map, greyed out -- as DATA_ARTIFACT_FLAG for U.S. BAs).
+CANADA_ARTIFACT_PROVINCES = {
+    "Newfoundland and Labrador": "CER capacity includes Churchill Falls (~5.4 GW), whose output is "
+                                 "contracted to Hydro-Quebec until 2041, so provincial headroom is overstated",
 }
 PROVINCE_ABBREV = {
     "Ontario": "ON", "Quebec": "QC", "Alberta": "AB", "British Columbia": "BC",
@@ -118,6 +127,10 @@ CANADA_DC_EXISTING_FLOOR_MW = {
 CANADA_DC_NEW_REF_MW = {
     # IESO Large Step Loads paper, Fig. 5: data-centre project load included in
     # the 2025 APO (likelihood-weighted), read from the chart (~+/-20 MW)
+    # Ontario is computed in canada_stress.py from IESO's exact 2025 APO table
+    # (data-centre energy growth since 2026, Demand Forecast Module Fig. 11),
+    # converted to MW with ONTARIO_DC_LOAD_FACTOR. These chart-read values
+    # (Large Step Loads paper Fig. 5) are only the fallback if the file is absent.
     "Ontario": {2025: 70, 2026: 140, 2027: 320, 2028: 405, 2029: 540, 2030: 640,
                 2031: 705, 2032: 785, 2033: 815, 2034: 825, 2035: 1070},
     # Hydro-Quebec: could reach 1,000 MW by 2035 -> linear from 190 MW in 2025
@@ -155,6 +168,20 @@ CANADA_DC_SITES = [
 NACEI_PLANT_FILES = [DATA_DIR / "nacei_plants_layer15.geojson", DATA_DIR / "nacei_plants_layer28.geojson"]
 OSM_LINES_DIR = DATA_DIR / "osm_power_lines"
 CA_HEX_CRS = "ESRI:102001"      # Canada Albers Equal Area
+IESO_APO_DFM_XLSB = DATA_DIR / "ieso_apo2025_Demand-Forecast-Module-Data.xlsb"
+# Energy -> peak MW for Ontario's data-centre growth. IESO's two 2025 products
+# agree at this value: APO energy growth 2026->2035 of 6.58 TWh (751 MW average)
+# vs the Large Step Loads paper's 1,070 MW of included project demand by 2035.
+ONTARIO_DC_LOAD_FACTOR = 0.70
+
+# Canadian siting model for new load without an announced site (stand-in for
+# IM3's rules): eligible hexes hold a >= 115 kV substation (OSM); score =
+# GRAVITY_WEIGHT x population within GRAVITY_RADIUS (market gravity, as IM3's
+# 50% scenario) + (1 - GRAVITY_WEIGHT) x grid strength (cheaper connection);
+# each province's unsited new load goes to its TOP_K hexes in proportion to score.
+CA_SITING_GRAVITY_WEIGHT = 0.5
+CA_SITING_GRAVITY_RADIUS_M = 100_000.0
+CA_SITING_TOP_K = 10
 
 
 # ----------------------------------------------------------------------------

@@ -100,8 +100,8 @@ def invariants() -> bool:
         _check("VisionQuest lat (Charlottetown)", vq["lat"].iloc[0] if len(vq) else None, 46.2372, 0.001),
         _check("Ontario CER capacity 2025 (MW)", head.loc["Ontario", "total_cap_2025_mw"], 44563.8, 0.1),
         _check("Ontario CER capacity 2035 (MW)", head.loc["Ontario", "total_cap_2035_mw"], 48357.1, 0.1),
-        _check("Ontario DC 2025 = IESO floor 293 + 70 new", ca.loc["Ontario", "dc_load_2025_mw"], 363, 0.5),
-        _check("Ontario DC 2035 = 293 + IESO 1,070 new", ca.loc["Ontario", "dc_load_2035_mw"], 1363, 0.5),
+        _check("Ontario DC 2025 = IESO Toronto floor 293", ca.loc["Ontario", "dc_load_2025_mw"], 293, 0.5),
+        _check("Ontario DC 2035 = 293 + IESO APO ~1,073 new", ca.loc["Ontario", "dc_load_2035_mw"], 1366, 1.0),
         _check("Alberta DC 2035 includes AESO 1,200 MW", ca.loc["Alberta", "dc_load_2035_mw"] - 1200, 10.8, 0.5),
         _check("bad geocodes flagged = 13", len(flagged), 13, 0),
     ])

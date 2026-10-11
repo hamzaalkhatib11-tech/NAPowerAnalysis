@@ -12,7 +12,7 @@ Background, data sources and methodology are in [PROJECT_HANDOFF.md](PROJECT_HAN
 | `canada_stress.py` | Canadian provincial stress for each year 2025 to 2035, using IESO, Hydro-Québec, AESO and B.C. data-centre figures (reference and high cases) |
 | `us_time_series.py` | U.S. BA stress index for each year 2025 to 2035, written to `output/us_ba_time_series_2025_2035.csv` for the Experience Builder year slider |
 | `local_stress.py` | Local stress on a 25 km hexagon grid, 2025 to 2035: data-centre load ÷ high-voltage supply reachable from each hex |
-| `canada_local_stress.py` | The same local gaps and yearly hot spots for ON, QC, AB, BC, NB and NS (8,586 hexes) |
+| `canada_local_stress.py` | The same local gaps and yearly hot spots for 9 provinces (11,831 hexes), with a siting model for new load |
 | `export_gis.py` | Joins the time series to BA and province polygons and writes time-enabled layers to `output/gis/` (File Geodatabase, zipped copy, GeoJSON) |
 | `sensitivity.py` | Re-runs the U.S. steps at 100 and 200 W/ft² and writes `output/sensitivity/w_per_sqft_summary.csv` (run separately, about 8 minutes) |
 | `geo.py` | Shared point-in-polygon helpers |
@@ -45,8 +45,11 @@ The full run takes about 17 minutes, mostly loading footprint tiles. Pass `--ski
 - `dataset-links.csv` and `electricity-capacity-technology-2026.csv`. Extract them from `GGR442_Datasets.zip`.
 - `2023-data-supplement-figures-supplement-donnees-2023.xlsx`
 - `nacei_plants_layer15.geojson` and `nacei_plants_layer28.geojson`: NRCan NACEI Canadian power plants (≥100 MW, and renewables ≥1 MW), from the `geoappext.nrcan.gc.ca` NACEI MapServer, layers 15 and 28
-- `osm_power_lines/CA-<prov>.json`: OpenStreetMap power lines, from the Overpass API (© OpenStreetMap contributors, ODbL).
-  - Nova Scotia (`CA-NS.json`) is missing because the server kept refusing it. Re-run the same Overpass query with `"ISO3166-2"="CA-NS"` when it's less busy.
+- `osm_power_lines/`: OpenStreetMap data from the Overpass API (© OpenStreetMap contributors, ODbL):
+  - `CA-<prov>.json`: power lines;
+  - `subs-CA-<prov>.json`: substations;
+  - `places-CA.json`: cities and towns with population.
+- `ieso_apo2025_Demand-Forecast-Module-Data.xlsb` (read with `pyxlsb`) and `ieso_apo2025_2025-Annual-Planning-Outlook-Data-Tables.xlsx`: IESO 2025 APO data tables
 - `part-*.csv.gz`, the footprint tiles. The footprint step prints the URL of any tile that's missing.
 
 ## U.S. time-series method (`us_time_series.py`)
@@ -85,22 +88,24 @@ The BA index says whether a region has headroom. The hex index says whether the 
 
 | Province | Existing load | New load, reference case | High case |
 |---|---|---|---|
-| Ontario | at least 293 MW (Toronto alone, per the IESO) | IESO 2025 APO project load: +1,070 MW by 2035 (IESO Large Step Loads paper, Fig. 5) | All proposed projects: +4,400 MW (Fig. 4) |
+| Ontario | at least 293 MW (Toronto alone, per the IESO) | IESO 2025 APO data-centre energy forecast, read from the exact table (Demand Forecast Module, Fig. 11): +1,073 MW by 2035. Converted to MW at a 0.70 load factor, which reconciles it with the Large Step Loads paper's 1,070 MW | All proposed projects: +4,400 MW (Large Step Loads paper, Fig. 4) |
 | Quebec | 190 MW at peak (Hydro-Québec) | Up to 1,000 MW by 2035 (Hydro-Québec) | 2,500 MW of requests under review, phased in by 2030 |
 | Alberta | building footprints | AESO Phase I, 2027–28: +1,200 MW (Meta, Industrial Heartland, 970 MW; TransAlta Keephills, 230 MW) | 4,800 MW qualified in Phase I |
 | B.C. | building footprints | Legislated allocation caps: +600 MW by 2029 | same as reference |
 
 - The baseline peak excludes existing data-centre load, the same rule as for U.S. BAs.
 - Alberta's 2025 peak is now the 12,785 MW record from December 2025.
+- Manitoba (5,111 MW), Saskatchewan (3,910 MW) and Newfoundland & Labrador (1,765 MW, Island system) were added. They have no known data centres yet.
+- Newfoundland & Labrador is flagged as a data artifact. Its CER capacity includes Churchill Falls (about 5.4 GW), whose output is contracted to Hydro-Québec until 2041.
 
 **Hex tier (`canada_local_stress.py`).** This uses the U.S. method with Canadian inputs:
 
 - **Headroom:** each province's headroom is shared across its hexes by grid strength. Grid strength is NRCan NACEI plants plus OpenStreetMap lines of 115 kV and above crossing the hex boundary.
-- **New load placement:** named sites go where they are (Alberta). Elsewhere, new load goes to existing data-centre clusters in proportion to their MW.
-- **Limitations:**
-  - There's no Canadian equivalent of IM3, so new sites aren't modelled.
-  - The NACEI plant data is from 2013–2021.
-  - Nova Scotia has plants only (`OSM_LINES = 0`).
+- **New load placement:** named sites go where they are (Alberta). The rest goes through a siting model that stands in for IM3, which covers only the U.S.:
+  - Eligible hexes contain an OpenStreetMap substation of 115 kV or above.
+  - `SITING_SCORE` = 0.5 × market gravity (population within 100 km) + 0.5 × grid strength, each log-scaled within the province. This mirrors IM3's 50% market-gravity scenario.
+  - Each province's unsited new load goes to its 10 best hexes, in proportion to their score.
+- **Limitation:** the NACEI plant data is from 2013–2021. It only sets each hex's share of headroom, so its age matters little.
 
 ## ArcGIS
 

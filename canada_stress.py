@@ -11,7 +11,9 @@ basis as the U.S. BA index.
   - DC load = existing + new:
       existing  max(footprint-derived provincial total, config floor)
                 (IESO: Toronto 293 MW; Hydro-Quebec: 190 MW at peak)
-      new       config.CANADA_DC_NEW_REF_MW -- IESO 2025 APO project load (ON),
+      new       Ontario: IESO 2025 APO data-centre energy growth since 2026 (exact
+                table, Demand Forecast Module Fig. 11) / ONTARIO_DC_LOAD_FACTOR;
+                others: config.CANADA_DC_NEW_REF_MW --
                 Hydro-Quebec 1,000 MW by 2035 (QC), AESO Phase I 1,200 MW (AB),
                 BC legislated allocation caps (BC); held flat where no source
       high case config.CANADA_DC_NEW_HIGH_MW (all proposed / requested load)
@@ -30,14 +32,15 @@ Writes to output/:
 import pandas as pd
 
 from config import (
-    BASE_YEAR, CANADA_DC_EXISTING_FLOOR_MW, CANADA_DC_NEW_HIGH_MW, CANADA_DC_NEW_REF_MW,
+    BASE_YEAR, CANADA_ARTIFACT_PROVINCES, CANADA_DC_EXISTING_FLOOR_MW, IESO_APO_DFM_XLSB, ONTARIO_DC_LOAD_FACTOR, CANADA_DC_NEW_HIGH_MW, CANADA_DC_NEW_REF_MW,
     CANADA_PEAK_LOAD_2025_MW, CER_CAPACITY_CSV, CER_EF2023_SUPPLEMENT_XLSX, CER_SCENARIO,
     FIG8_BASE_YEAR, FIG8_END_YEAR, HOURS_PER_YEAR, IESO_BASE_YEAR, IESO_DC_CAGR, IESO_DC_TWH_2026,
     OUT_DIR, PROVINCE_ABBREV, TARGET_YEAR,
 )
 
 SOURCES = {
-    "Ontario": "IESO Large Step Loads paper (2025 APO data-centre project load, Fig. 5)",
+    "Ontario": "IESO 2025 APO data-centre energy forecast (Demand Forecast Module Fig. 11), "
+               "converted at a 0.70 load factor",
     "Quebec": "Hydro-Quebec: 190 MW at peak today, up to 1,000 MW by 2035",
     "Alberta": "AESO Large Load Phase I: 1,200 MW (Meta 970, Keephills 230), 2027-28",
     "British Columbia": "BC data-centre allocation caps (400 MW 2026-28, 200 MW 2028-29)",
@@ -73,7 +76,27 @@ def existing_dc(province: str, footprint_mw: float) -> float:
     return max(footprint_mw, CANADA_DC_EXISTING_FLOOR_MW.get(province, 0.0))
 
 
+def ontario_apo_new_mw() -> dict | None:
+    """{year: MW} of new Ontario data-centre load from IESO's 2025 APO table:
+    net annual energy growth since the start of 2026, converted to MW with
+    ONTARIO_DC_LOAD_FACTOR. None if the workbook isn't in data/."""
+    if not IESO_APO_DFM_XLSB.exists():
+        return None
+    sheet = pd.read_excel(IESO_APO_DFM_XLSB, sheet_name="Figure 11", header=None, engine="pyxlsb")
+    years = sheet.iloc[8, 4:].dropna().astype(int).tolist()
+    row = sheet[sheet.iloc[:, 2].astype(str).str.strip() == "Data Centres"].iloc[0, 4:4 + len(years)]
+    twh = dict(zip(years, row.astype(float)))
+    out = {BASE_YEAR: 0.0}
+    out.update({y: max(t, 0.0) * 1e6 / HOURS_PER_YEAR / ONTARIO_DC_LOAD_FACTOR for y, t in twh.items()})
+    return out
+
+
+ONTARIO_APO = ontario_apo_new_mw()
+
+
 def new_dc(province: str, year: int, high: bool = False) -> float:
+    if province == "Ontario" and not high and ONTARIO_APO is not None:
+        return float(ONTARIO_APO.get(year, 0.0))
     table = (CANADA_DC_NEW_HIGH_MW if high else CANADA_DC_NEW_REF_MW).get(province)
     if table is None and high:
         table = CANADA_DC_NEW_REF_MW.get(province)
@@ -117,6 +140,8 @@ def main():
                 "stress_index_high": load_high / avail if avail > 0 else float("nan"),
                 "footprint_mw": float(footprint.get(prov, 0.0)),
                 "dc_growth_source": SOURCES.get(prov, FLAT_SOURCE),
+                "data_artifact_flag": prov in CANADA_ARTIFACT_PROVINCES,
+                "artifact_reason": CANADA_ARTIFACT_PROVINCES.get(prov, ""),
             })
     ts = pd.DataFrame(rows)
     ts.to_csv(OUT_DIR / "canada_stress_index_timeseries.csv", index=False)
