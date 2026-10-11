@@ -13,6 +13,7 @@ Background, data sources and methodology are in [PROJECT_HANDOFF.md](PROJECT_HAN
 | `us_time_series.py` | U.S. BA stress index for each year 2025 to 2035, written to `output/us_ba_time_series_2025_2035.csv` for the Experience Builder year slider |
 | `local_stress.py` | Local stress on a 25 km hexagon grid, 2025 to 2035: data-centre load ÷ high-voltage supply reachable from each hex |
 | `export_gis.py` | Joins the time series to BA and province polygons and writes time-enabled layers to `output/gis/` (File Geodatabase, zipped copy, GeoJSON) |
+| `sensitivity.py` | Re-runs the U.S. steps at 100 and 200 W/ft² and writes `output/sensitivity/w_per_sqft_summary.csv` (run separately, about 8 minutes) |
 | `geo.py` | Shared point-in-polygon helpers |
 | `verify_outputs.py` | Diffs `output/` against `reference_outputs/`, then checks invariants and the time series |
 | `run_pipeline.py` | Runs all of the above in order |
@@ -60,7 +61,7 @@ The BA index asks "is there enough generation in the region?" The hex index asks
 
 - **Grid:** 15,431 flat-topped hexagons, 25 km across, covering the lower 48 states (CONUS Albers projection).
 - **`DC_LOAD_MW`:** the same data-centre load as the BA tier, located at its points. Hex totals add up to the BA totals.
-- **`LOCAL_SUPPLY_MW`:** generation located in the hex (EIA-860M, by year, including each BA's build-rate top-up placed where that BA built in 2021–2025), plus transmission lines of 115 kV and above that cross the hex boundary, rated by voltage class (`LINE_RATING_MW_BY_KV`, to be cited).
+- **`LOCAL_SUPPLY_MW`:** generation located in the hex (EIA-860M, by year, including each BA's build-rate top-up placed where that BA built in 2021–2025), plus transmission lines of 115 kV and above that cross the hex boundary, rated by voltage with the power-law fit to FERC line data in Athari & Wang (2017), arXiv:1709.06930 (`LINE_RATING_FIT`).
 - **`LOCAL_STRESS`:** `DC_LOAD_MW / LOCAL_SUPPLY_MW`. Existing local demand is **not** subtracted, so this ranks hexes against each other: 1.0 is not a capacity gap the way it is for the BA index. It's a screening index, not a power-flow study.
 - **`LOCAL_STRESS_CAPPED`:** capped at 3.0, and set to 3.0 where a hex has data-centre load but no line of 115 kV or above (`NO_HV_ACCESS = 1`). This is the field to use for hot spot analysis.
 

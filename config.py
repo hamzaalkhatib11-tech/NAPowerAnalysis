@@ -6,11 +6,13 @@ Every script imports from here so a parameter only ever changes in one place.
 """
 
 import math
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
-OUT_DIR = ROOT / "output"
+# GGR_OUT_DIR / GGR_W_PER_SQFT let sensitivity.py run the pipeline into a side folder
+OUT_DIR = Path(os.environ.get("GGR_OUT_DIR", ROOT / "output"))
 REFERENCE_DIR = ROOT / "reference_outputs"
 
 # ----------------------------------------------------------------------------
@@ -32,7 +34,9 @@ CER_EF2023_SUPPLEMENT_XLSX = DATA_DIR / "2023-data-supplement-figures-supplement
 # ----------------------------------------------------------------------------
 # Assumptions (see PROJECT_HANDOFF.md §4)
 # ----------------------------------------------------------------------------
-W_PER_SQFT = 150.0              # <-- REVIEW: placeholder, needs a citable source
+# 150 is consistent with the data: IM3 building sqft against Databricks Active MW
+# implies ~159 W/ft2 nationally. sensitivity.py brackets it at 100 and 200.
+W_PER_SQFT = float(os.environ.get("GGR_W_PER_SQFT", 150.0))
 DEDUP_RADIUS_M = 150.0          # 400 m merged separate buildings on the same campus
 IM3_EXCLUDED_TYPES = {"campus"}  # IM3 campus "sqft" is acquired land area, not floor area
 DATABRICKS_BASELINE_STAGES = {"Active"}   # 2025 control totals exclude Announcement/Construction
@@ -145,19 +149,19 @@ EXCLUDED_STATES = {"AK", "HI", "PR", "VI", "GU", "AS", "MP"}   # CONUS only
 # 161 kV), so sub-transmission from 115 kV counts. Lower voltages can't carry a
 # campus-scale load.
 MIN_LINE_KV = 115
-# Approximate per-circuit carrying capacity by voltage class, MW. Short line
-# segments are thermally limited rather than stability-limited, so these sit
-# above surge-impedance loading. Screening values only.
-LINE_RATING_MW_BY_KV = [        # <-- REVIEW: cite a published table before publishing
-    (735, 4000),
-    (500, 2500),
-    (345, 1200),
-    (230, 500),
-    (138, 250),
-    (115, 175),
-]
+# Per-circuit capacity by voltage: the power-law fit to the average MVA rating of
+# real U.S. transmission lines in FERC data, S = a * kV^b, from
+#   Athari, M. H. & Wang, Z. (2017). "Interdependence of Transmission Branch
+#   Parameters on the Voltage Levels." arXiv:1709.06930, Fig. 13.
+# MVA is taken as MW (power factor ~1). Gives ~214 MW at 115 kV, ~633 at 230 kV,
+# ~1,190 at 345 kV, ~2,170 at 500 kV, ~3,980 at 735 kV.
+LINE_RATING_FIT = (0.1295, 1.565)
 LINE_KV_VALID = (1, 1100)       # HIFLD uses -999999 for unknown voltage
 LOCAL_STRESS_CAP = 3.0          # analysis field is capped so one hex can't dominate a hot spot run
+# Below this, a hex's data-centre load is small enough to be served from the
+# distribution network, so having no >= 115 kV line isn't a pressure point. Without
+# it, a 2.7 MW site in Wisconsin was capped at 3.0 and seeded a 7-hex hot spot.
+MIN_DC_MW_FOR_HV = 10.0
 
 # GIS export (export_gis.py)
 GIS_DIR = OUT_DIR / "gis"

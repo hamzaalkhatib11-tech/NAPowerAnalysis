@@ -18,8 +18,9 @@ substation side of the project question.
                    BA's build-rate top-up placed where that BA built in
                    2021-2025 (new capacity sited like recent capacity)
     TX_CAPACITY_MW HIFLD transmission lines >= MIN_LINE_KV (115 kV) CROSSING the
-                   hex boundary, each counted once and rated by voltage class
-                   (LINE_RATING_MW_BY_KV); static. Segments entirely inside a
+                   hex boundary, each counted once and rated with the FERC-data
+                   voltage fit of Athari & Wang 2017 (LINE_RATING_FIT); static.
+                   Segments entirely inside a
                    hex are left out -- HIFLD splits circuits at every
                    substation, so summing internal segments counted a dense
                    metro network many times over (52 GW for one Loudoun hex).
@@ -31,8 +32,10 @@ this hex that data centres would use". It ranks hexes against each other; 1.0
 is NOT a capacity gap the way it is for the BA index. A screening index, not a
 power-flow study.
 
-Hexes with data-centre load but no >= 115 kV line and no generation get
-NO_HV_ACCESS = 1, LOCAL_STRESS = null and LOCAL_STRESS_CAPPED = LOCAL_STRESS_CAP.
+Hexes with at least MIN_DC_MW_FOR_HV of data-centre load but no >= 115 kV line
+and no generation get NO_HV_ACCESS = 1, LOCAL_STRESS = null and
+LOCAL_STRESS_CAPPED = LOCAL_STRESS_CAP. Sites under MIN_DC_MW_FOR_HV with no
+>= 115 kV line are assumed to run off the distribution network and get 0.
 LOCAL_STRESS_CAPPED is the field to feed Emerging Hot Spot Analysis.
 
 Writes to output/:
@@ -53,7 +56,7 @@ from shapely.geometry import shape as shapely_shape
 
 from config import (
     EIA_PLANNED_STATUSES, EXCLUDED_STATES, GROWTH_PUE, HEX_CRS, HEX_WIDTH_M,
-    LINE_KV_VALID, LINE_RATING_MW_BY_KV, LOCAL_STRESS_CAP, MIN_LINE_KV, OUT_DIR, TIGER_STATES_ZIP,
+    LINE_KV_VALID, LINE_RATING_FIT, LOCAL_STRESS_CAP, MIN_DC_MW_FOR_HV, MIN_LINE_KV, OUT_DIR, TIGER_STATES_ZIP,
     TRANSMISSION_ZIP, TREND_HISTORY_YEARS, TS_YEARS,
 )
 from geo import join_ba, load_control_areas, read_prj_from_zip
@@ -188,10 +191,9 @@ def local_generation(hexes) -> dict:
 
 
 def line_rating(kv: float) -> float:
-    for threshold, mw in LINE_RATING_MW_BY_KV:
-        if kv >= threshold:
-            return mw
-    return 0.0
+    """Average FERC line rating at this voltage (Athari & Wang 2017, Fig. 13), MW."""
+    a, b = LINE_RATING_FIT
+    return a * kv ** b if kv >= MIN_LINE_KV else 0.0
 
 
 def load_hv_lines() -> pd.DataFrame:
@@ -252,9 +254,11 @@ def main():
     for year in TS_YEARS:
         load = dc_existing + dc_new * ramp(year)
         supply = gen[year] + tx
-        no_access = (load > 0) & (supply <= 0)
+        # small sites with no HV line are distribution-served: not a pressure point
+        distribution = (load > 0) & (load < MIN_DC_MW_FOR_HV) & (tx <= 0)
+        no_access = (load >= MIN_DC_MW_FOR_HV) & (supply <= 0)
         with np.errstate(divide="ignore", invalid="ignore"):
-            stress = np.where(load > 0, load / supply, 0.0)
+            stress = np.where((load > 0) & ~distribution & ~no_access, load / supply, 0.0)
         stress[no_access] = np.nan
         capped = np.where(no_access, LOCAL_STRESS_CAP, np.minimum(np.nan_to_num(stress), LOCAL_STRESS_CAP))
         ba_stress = [ba_ts["STRESS_INDEX"].get((b, year), np.nan) if b else np.nan for b in hexes["BA_NAME"]]
