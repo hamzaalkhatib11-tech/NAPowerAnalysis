@@ -240,6 +240,12 @@ MIN_LINE_KV = 115
 # ~1,190 at 345 kV, ~2,170 at 500 kV, ~3,980 at 735 kV.
 LINE_RATING_FIT = (0.1295, 1.565)
 LINE_KV_VALID = (1, 1100)       # HIFLD uses -999999 for unknown voltage
+# A line only adds to a hex's grid strength where it can deliver power there:
+# it must cross into the hex AND reach a >= MIN_LINE_KV substation inside it
+# (within SUBSTATION_SNAP_M of the substation's OSM point). Lines that merely pass
+# through, with no substation, serve somewhere else and count for nothing.
+US_SUBSTATIONS_DIR = DATA_DIR / "osm_us_substations"
+SUBSTATION_SNAP_M = 1000.0
 # Yearly hot spots of capacity gaps (Getis-Ord Gi*, binary weights within this
 # distance, self included). 75 km = the two rings of hexes around each hex
 # (~18 neighbours), roughly a metro area or a utility planning zone.

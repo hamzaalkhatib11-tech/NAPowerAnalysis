@@ -20,7 +20,9 @@ that headroom deliverable in a given place covers the data centres planned there
   GRID_STRENGTH_MW LOCAL_GEN_MW + TX_CAPACITY_MW -- used only as a *share*
     LOCAL_GEN_MW   EIA-860M units in the hex online in year y, plus the BA's
                    build-rate top-up placed where that BA built in 2021-2025
-    TX_CAPACITY_MW HIFLD lines >= MIN_LINE_KV (115 kV) CROSSING the hex boundary,
+    TX_CAPACITY_MW HIFLD lines >= MIN_LINE_KV (115 kV) that cross into the hex AND
+                   reach an OSM substation >= 115 kV inside it (within
+                   SUBSTATION_SNAP_M; pass-through lines serve elsewhere),
                    each counted once, rated with the FERC-data voltage fit of
                    Athari & Wang 2017 (LINE_RATING_FIT). Internal segments are
                    left out (HIFLD splits circuits at every substation).
@@ -68,7 +70,7 @@ from sklearn.neighbors import BallTree
 
 from config import (
     GI_DISTANCE_M, GI_FDR, EIA_PLANNED_STATUSES, EXCLUDED_STATES, GROWTH_PUE, HEX_CRS, HEX_WIDTH_M,
-    LINE_KV_VALID, LINE_RATING_FIT, LOCAL_STRESS_CAP, MIN_DC_MW_FOR_HV, MIN_LINE_KV, OUT_DIR, TIGER_STATES_ZIP,
+    LINE_KV_VALID, LINE_RATING_FIT, SUBSTATION_SNAP_M, US_SUBSTATIONS_DIR, LOCAL_STRESS_CAP, MIN_DC_MW_FOR_HV, MIN_LINE_KV, OUT_DIR, TIGER_STATES_ZIP,
     TRANSMISSION_ZIP, TREND_HISTORY_YEARS, TS_YEARS,
 )
 from geo import join_ba, load_control_areas, read_prj_from_zip
@@ -225,17 +227,68 @@ def load_hv_lines() -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def transmission_capacity(hexes, lines) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    boundaries = shapely.boundary(hexes["geometry"].to_numpy())
-    h_idx, l_idx = shapely.STRtree(lines["geometry"].to_numpy()).query(boundaries, predicate="intersects")
+def osm_kv(voltage) -> float:
+    """Highest voltage in an OSM voltage tag ("230000;115000" -> 230), in kV."""
+    import re
+    nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", str(voltage or ""))]
+    return max(nums) / 1000 if nums else 0.0
+
+
+def load_osm_substations(paths, to_hex) -> np.ndarray:
+    """(x, y) in the hex CRS of OSM substations >= MIN_LINE_KV, de-duplicated by OSM id."""
+    seen, xy = set(), []
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as f:
+                elements = json.load(f).get("elements", [])
+        except (json.JSONDecodeError, OSError):
+            print(f"  WARNING: {path.name} unreadable -- skipped")
+            continue
+        for e in elements:
+            key = (e.get("type"), e.get("id"))
+            if key in seen or osm_kv(e.get("tags", {}).get("voltage")) < MIN_LINE_KV:
+                continue
+            pt = e.get("center") or e
+            if "lat" in pt:
+                seen.add(key)
+                xy.append(to_hex.transform(pt["lon"], pt["lat"]))
+    return np.array(xy).reshape(-1, 2)
+
+
+def transmission_capacity(hexes, lines, sub_xy: np.ndarray | None = None):
+    """Per hex: rated MW and count of >= MIN_LINE_KV lines that deliver into it, max kV,
+    and number of substations.
+
+    A line counts for a hex when it crosses the hex boundary AND comes within
+    SUBSTATION_SNAP_M of a substation inside the hex -- power is taken off a line
+    only at a substation, so a line that just passes through serves somewhere
+    else. Without substation data, falls back to boundary crossings alone."""
+    geoms = hexes["geometry"].to_numpy()
+    line_tree = shapely.STRtree(lines["geometry"].to_numpy())
+    h_idx, l_idx = line_tree.query(shapely.boundary(geoms), predicate="intersects")
+    n_subs = np.zeros(len(hexes))
+    if sub_xy is not None and len(sub_xy):
+        sub_pts = shapely.points(sub_xy)
+        s_idx, s_hex = shapely.STRtree(geoms).query(sub_pts, predicate="intersects")
+        hex_of_sub = pd.Series(s_hex, index=s_idx).groupby(level=0).first()
+        n_subs = np.bincount(hex_of_sub.to_numpy(), minlength=len(hexes)).astype(float)
+        sp_idx, sl_idx = line_tree.query(sub_pts, predicate="dwithin", distance=SUBSTATION_SNAP_M)
+        keep = np.isin(sp_idx, hex_of_sub.index.to_numpy())
+        delivering = set(zip(hex_of_sub.loc[sp_idx[keep]].to_numpy(), sl_idx[keep]))
+        mask = np.array([(h, l) in delivering for h, l in zip(h_idx, l_idx)], dtype=bool)
+        print(f"  {mask.sum():,} of {len(mask):,} line crossings reach a substation in the hex")
+        h_idx, l_idx = h_idx[mask], l_idx[mask]
+    else:
+        print("  WARNING: no substation data -- counting every line that crosses a hex boundary")
     pairs = pd.DataFrame({"hex": h_idx, "mw": lines["rating_mw"].to_numpy()[l_idx],
                           "kv": lines["kv"].to_numpy()[l_idx]})
     g = pairs.groupby("hex")
     cap, n, kv = (np.zeros(len(hexes)) for _ in range(3))
-    cap[g["mw"].sum().index] = g["mw"].sum().to_numpy()
-    n[g.size().index] = g.size().to_numpy()
-    kv[g["kv"].max().index] = g["kv"].max().to_numpy()
-    return cap, n, kv
+    if len(pairs):
+        cap[g["mw"].sum().index] = g["mw"].sum().to_numpy()
+        n[g.size().index] = g.size().to_numpy()
+        kv[g["kv"].max().index] = g["kv"].max().to_numpy()
+    return cap, n, kv, n_subs
 
 
 # ----------------------------------------------------------------------------
@@ -313,7 +366,9 @@ def main():
 
     print("Supply ...")
     lines = load_hv_lines()
-    tx, n_lines, max_kv = transmission_capacity(hexes, lines)
+    sub_xy = load_osm_substations(sorted(US_SUBSTATIONS_DIR.glob("subs-US-*.json")), TO_HEX)
+    print(f"  {len(sub_xy):,} OSM substations >= {MIN_LINE_KV} kV")
+    tx, n_lines, max_kv, n_subs = transmission_capacity(hexes, lines, sub_xy)
     print(f"  {len(lines):,} lines >= {MIN_LINE_KV} kV; {(tx > 0).sum():,} hexes reach one")
     gen = local_generation(hexes)
     gi = GiStar(shapely.get_coordinates(shapely.centroid(hexes["geometry"].to_numpy())), GI_DISTANCE_M)
@@ -354,6 +409,7 @@ def main():
             "LOCAL_STRESS_CAPPED": capped, "DATA_ARTIFACT_FLAG": artifact.astype(int),
             "DC_EXISTING_MW": dc_existing, "DC_NEW_MW": dc_new * ramp(year),
             "GRID_STRENGTH_MW": strength, "LOCAL_GEN_MW": gen[year], "TX_CAPACITY_MW": tx,
+            "HV_LINES_DELIVERING": n_lines, "HV_SUBSTATIONS": n_subs,
             "BA_HEADROOM_SHARE_MW": share_mw, "BA_STRESS_INDEX": ba_stress,
         }))
     ts = pd.concat(frames, ignore_index=True)
@@ -377,10 +433,10 @@ def main():
                             lambda xy: np.column_stack(TO_WGS.transform(xy[:, 0], xy[:, 1])))
     features = [{"type": "Feature",
                  "properties": {"HEX_ID": h, "STATE": s, "BA_NAME": b, "TX_CAPACITY_MW": float(t),
-                                "HV_LINES": int(n), "MAX_KV": float(k)},
+                                "HV_LINES": int(n), "MAX_KV": float(k), "HV_SUBSTATIONS": int(ns)},
                  "geometry": json.loads(shapely.to_geojson(shapely.set_precision(g, 1e-5)))}
-                for h, s, b, t, n, k, g in zip(hexes["HEX_ID"], hexes["STATE"], hexes["BA_NAME"],
-                                               tx, n_lines, max_kv, wgs)]
+                for h, s, b, t, n, k, ns, g in zip(hexes["HEX_ID"], hexes["STATE"], hexes["BA_NAME"],
+                                                   tx, n_lines, max_kv, n_subs, wgs)]
     with open(OUT_DIR / "us_hex_grid.geojson", "w", encoding="utf-8") as f:
         json.dump({"type": "FeatureCollection", "features": features}, f)
     print(f"Wrote us_hex_local_stress_2025_2035.csv ({len(ts):,} rows) and us_hex_grid.geojson")

@@ -40,6 +40,7 @@ The full run takes about 17 minutes, mostly loading footprint tiles. Pass `--ski
 - `EIA930_BALANCE_2025_Jan_Jun.csv` and `EIA930_BALANCE_2025_Jul_Dec.csv`: EIA-930 hourly demand, from eia.gov/electricity/gridmonitor/sixMonthFiles
 - `control-areas-shapefile/`
 - `tl_2025_us_state.zip`
+- `osm_us_substations/subs-US-<1..8>.json`: OpenStreetMap substations tagged with a voltage, lower 48 states, in 8 regional tiles from the Overpass API (© OpenStreetMap contributors, ODbL)
 - `US_Electric_Power_Transmission_Lines_-124296575735781399.zip`: HIFLD transmission lines, used by the local tier
 - `lpr_000b21a_e.zip`
 - `dataset-links.csv` and `electricity-capacity-technology-2026.csv`. Extract them from `GGR442_Datasets.zip`.
@@ -68,7 +69,8 @@ The BA index says whether a region has headroom. The hex index says whether the 
 
 - **Grid:** 15,431 flat-topped hexagons, 25 km across, covering the lower 48 states.
 - **`LOCAL_HEADROOM_MW`:** the BA's headroom for that year (capacity minus non-data-centre peak, from the BA tier), multiplied by the hex's share of the BA's grid strength. It is never less than the hex's existing data-centre load, because what runs today is served.
-  - Grid strength is generation in the hex, plus lines of 115 kV and above crossing the hex boundary, rated with the FERC-data fit in Athari & Wang (2017), arXiv:1709.06930.
+  - Grid strength is generation in the hex, plus lines of 115 kV and above that **cross into the hex and reach a substation of 115 kV or above inside it** (within 1 km of the substation, using OpenStreetMap substations). Lines are rated with the FERC-data fit in Athari & Wang (2017), arXiv:1709.06930.
+  - Lines that only pass through serve somewhere else, so they don't count. That excludes 35% of line crossings in the U.S. and 66% in Canada.
   - Hex values add back up to the BA's headroom, so the two tiers agree.
 - **`LOCAL_STRESS`:** `DC_LOAD_MW / LOCAL_HEADROOM_MW`, where above 1 is a local gap.
 - **`DC_GAP_MW`:** the data-centre load that the local headroom can't serve.
@@ -100,7 +102,7 @@ The BA index says whether a region has headroom. The hex index says whether the 
 
 **Hex tier (`canada_local_stress.py`).** This uses the U.S. method with Canadian inputs:
 
-- **Headroom:** each province's headroom is shared across its hexes by grid strength. Grid strength is NRCan NACEI plants plus OpenStreetMap lines of 115 kV and above crossing the hex boundary.
+- **Headroom:** each province's headroom is shared across its hexes by grid strength. Grid strength is NRCan NACEI plants plus OpenStreetMap lines of 115 kV and above that reach a substation inside the hex, the same rule as the U.S.
 - **New load placement:** named sites go where they are (Alberta). The rest goes through a siting model that stands in for IM3, which covers only the U.S.:
   - Eligible hexes contain an OpenStreetMap substation of 115 kV or above.
   - `SITING_SCORE` = 0.5 × market gravity (population within 100 km) + 0.5 × grid strength, each log-scaled within the province. This mirrors IM3's 50% market-gravity scenario.

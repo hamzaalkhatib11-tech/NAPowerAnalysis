@@ -19,8 +19,9 @@ provinces with a provincial stress series (ON, QC, AB, BC, MB, SK, NB, NS, NL),
                      by the siting model below
   GRID_STRENGTH_MW   NRCan NACEI power plants (>= 100 MW, and renewables >= 1 MW;
                      static, 2013-2021 vintage) + OpenStreetMap lines >= 115 kV
-                     crossing the hex boundary, rated with the same FERC-data
-                     voltage fit as the U.S. (Athari & Wang 2017)
+                     that cross into the hex AND reach a >= 115 kV substation
+                     inside it (pass-through lines don't count), rated with the
+                     same FERC-data voltage fit as the U.S. (Athari & Wang 2017)
 
 Siting model (stand-in for IM3, which covers only the U.S.): eligible hexes
 hold an OSM substation >= 115 kV; SITING_SCORE = CA_SITING_GRAVITY_WEIGHT x
@@ -53,7 +54,10 @@ from config import (
     NACEI_PLANT_FILES, OSM_LINES_DIR, OUT_DIR, STATCAN_PROVINCES_ZIP, TS_YEARS,
 )
 from geo import read_prj_from_zip
-from local_stress import GI_LABELS, GiStar, assign_to_hex, hex_grid, line_rating
+from local_stress import (
+    GI_LABELS, GiStar, assign_to_hex, hex_grid, line_rating, load_osm_substations, osm_kv,
+    transmission_capacity,
+)
 
 WGS84 = "EPSG:4326"
 TO_HEX = Transformer.from_crs(WGS84, CA_HEX_CRS, always_xy=True)
@@ -138,27 +142,6 @@ def demand(hexes, pts, prov_ts: pd.DataFrame, siting_weights: dict) -> tuple[np.
 # ----------------------------------------------------------------------------
 # Siting model (stand-in for IM3)
 # ----------------------------------------------------------------------------
-def load_substations(hexes) -> np.ndarray:
-    """Count of OSM substations >= MIN_LINE_KV per hex."""
-    lons, lats = [], []
-    for path in sorted(OSM_LINES_DIR.glob("subs-CA-*.json")):
-        try:
-            with open(path, encoding="utf-8") as f:
-                elements = json.load(f).get("elements", [])
-        except (json.JSONDecodeError, OSError):
-            print(f"  WARNING: {path.name} unreadable -- skipped")
-            continue
-        for e in elements:
-            if osm_kv(e.get("tags", {}).get("voltage")) < MIN_LINE_KV:
-                continue
-            pt = e.get("center") or e
-            if "lat" in pt:
-                lons.append(pt["lon"]), lats.append(pt["lat"])
-    idx = assign_to_hex(lons, lats, hexes, TO_HEX)
-    print(f"  {len(lons):,} OSM substations >= {MIN_LINE_KV} kV")
-    return np.bincount(idx[idx >= 0], minlength=len(hexes))
-
-
 def market_gravity(hexes) -> np.ndarray:
     """Population of OSM cities/towns within CA_SITING_GRAVITY_RADIUS_M of each hex centre."""
     with open(OSM_LINES_DIR / "places-CA.json", encoding="utf-8") as f:
@@ -219,11 +202,6 @@ def plant_capacity(hexes) -> np.ndarray:
     return np.bincount(idx[ok], weights=plants["Total_MW"].to_numpy()[ok], minlength=len(hexes))
 
 
-def osm_kv(voltage: str | None) -> float:
-    nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", voltage or "")]
-    return max(nums) / 1000 if nums else 0.0
-
-
 def load_osm_lines() -> pd.DataFrame:
     rows = []
     for path in sorted(OSM_LINES_DIR.glob("CA-*.json")):
@@ -246,12 +224,6 @@ def load_osm_lines() -> pd.DataFrame:
     return lines.reset_index(drop=True)
 
 
-def transmission_capacity(hexes, lines) -> np.ndarray:
-    boundaries = shapely.boundary(hexes["geometry"].to_numpy())
-    h_idx, l_idx = shapely.STRtree(lines["geometry"].to_numpy()).query(boundaries, predicate="intersects")
-    return np.bincount(h_idx, weights=lines["rating_mw"].to_numpy()[l_idx], minlength=len(hexes))
-
-
 # ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
@@ -265,12 +237,13 @@ def main():
     print("Supply ...")
     plants = plant_capacity(hexes)
     lines = load_osm_lines()
-    tx = transmission_capacity(hexes, lines)
+    sub_xy = load_osm_substations(sorted(OSM_LINES_DIR.glob("subs-CA-*.json")), TO_HEX)
+    print(f"  {len(sub_xy):,} OSM substations >= {MIN_LINE_KV} kV")
+    tx, _, _, substations = transmission_capacity(hexes, lines, sub_xy)
     print(f"  {len(lines):,} OSM lines >= {MIN_LINE_KV} kV; {(tx > 0).sum():,} hexes reach one")
     strength = plants + tx
 
     print("Siting model ...")
-    substations = load_substations(hexes)
     gravity = market_gravity(hexes)
     siting_score, siting_weights = siting_model(hexes, strength, substations, gravity)
     for p, w in siting_weights.items():
