@@ -192,11 +192,12 @@ def canada_local_checks() -> bool:
     print("\n=== Canadian hex tier ===")
     ok = []
     for year in (2025, 2035):
-        h = hx.loc[hx["YEAR"] == year, "DC_LOAD_MW"].sum()
-        b = pr.loc[pr["year"] == year, "dc_load_mw"].sum()
-        good = abs(h - b) < 1.0
-        ok.append(good)
-        print(f"  [{'PASS' if good else 'FAIL'}] {year} hex DC load {h:,.0f} MW vs provinces {b:,.0f} MW")
+        for hex_col, prov_col, label in (("DC_LOAD_MW", "dc_load_mw", ""), ("DC_LOAD_HIGH_MW", "dc_load_high_mw", " (high case)")):
+            h = hx.loc[hx["YEAR"] == year, hex_col].sum()
+            b = pr.loc[pr["year"] == year, prov_col].sum()
+            good = abs(h - b) < 1.0
+            ok.append(good)
+            print(f"  [{'PASS' if good else 'FAIL'}] {year} hex DC load{label} {h:,.0f} MW vs provinces {b:,.0f} MW")
     no_gap = hx.loc[hx["YEAR"] == 2025, "DC_GAP_MW"].sum() == 0
     ok.append(no_gap)
     print(f"  [{'PASS' if no_gap else 'FAIL'}] no local gaps in 2025")

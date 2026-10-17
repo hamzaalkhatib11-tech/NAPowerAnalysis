@@ -127,6 +127,10 @@ Results for 2035 (run on 2026-10-17):
   - Eligible hexes contain an OpenStreetMap substation of 115 kV or above.
   - `SITING_SCORE` = 0.5 × market gravity (population within 100 km) + 0.5 × grid strength, each log-scaled within the province. This mirrors IM3's 50% market-gravity scenario.
   - Each province's unsited new load goes to its 10 best hexes, in proportion to their score.
+- **High case:** the `_HIGH` fields (`DC_LOAD_HIGH_MW`, `LOCAL_STRESS_HIGH`, `DC_GAP_HIGH_MW`, `LOCAL_CLASS_HIGH`, `GI_*_HIGH`) repeat the analysis with all proposed or requested load (`dc_load_high_mw` from `canada_stress.py`). Named sites keep their own MW, and the extra load goes to the siting model. Headroom is the same in both cases.
+  - In the reference case, Ontario's 1,073 MW is spread about 105 MW per hex, and no hex is short. Its only hot spot is around Edmonton, where Meta's 970 MW sits in one hex.
+  - In the 2035 high case, 27 hexes are short: Ontario 10 (1,638 MW), Quebec 10 (1,039 MW) and Alberta 7 (1,445 MW). There are 167 hot spot hexes, 80 of them in Ontario.
+  - So the Ontario result depends on how concentrated the load is. Campuses are hundreds of MW each, so the reference-case spread is probably optimistic.
 - **Limitation:** the NACEI plant data is from 2013–2021. It only sets each hex's share of headroom, so its age matters little.
 
 ## ArcGIS
@@ -146,7 +150,7 @@ Two things are ready to upload:
 | `dc_growth_sites_2035` | IM3 projected sites for 2035 |
 | `us_hex_local_stress_timeseries` | 169,741 hexagons (15,431 × 11 years). Time field: `YEAR_DATE` |
 | `transmission_115kv_plus` | 51,097 lines of 115 kV and above, with the MW rating used |
-| `ca_hex_local_stress_timeseries` | 94,446 Canadian hexagons (8,586 × 11 years), same fields as the U.S. hex layer (`PROVINCE` instead of `BA_NAME`) |
+| `ca_hex_local_stress_timeseries` | 130,141 Canadian hexagons (11,831 × 11 years), same fields as the U.S. hex layer (`PROVINCE` instead of `BA_NAME`), plus the high-case `_HIGH` fields |
 | `ca_transmission_osm_115kv_plus` | 10,187 OpenStreetMap lines of 115 kV and above. Credit "© OpenStreetMap contributors" on the map |
 
 **To set up the time slider:**
@@ -163,6 +167,7 @@ On `us_hex_local_stress_timeseries`:
 1. Enable time on `YEAR_DATE` with a 1-year step.
 2. Symbolize with **Unique Values** on `GI_PATTERN`, using the ArcGIS hot spot colours, with "Not Significant" set to no fill.
 3. Add a second copy filtered to `LOCAL_CLASS = 'gap'` to show the hexes that are actually short.
+4. For the Canadian high case, add a copy of `ca_hex_local_stress_timeseries` symbolized on `GI_PATTERN_HIGH`, with `LOCAL_CLASS_HIGH = 'gap'` for the outline copy. The dashboard's scenario switch then toggles between the two copies.
 
 **Decade trend (static):**
 

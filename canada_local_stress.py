@@ -11,6 +11,9 @@ provinces with a provincial stress series (ON, QC, AB, BC, MB, SK, NB, NS, NL),
   LOCAL_STRESS       DC_LOAD_MW / LOCAL_HEADROOM_MW   (> 1 = local gap)
   DC_GAP_MW          max(DC_LOAD_MW - LOCAL_HEADROOM_MW, 0)
   Gi* hot spots      on DC_GAP_MW, pooled across years (as in the U.S. tier)
+  *_HIGH fields      the same for the high case (dc_load_high_mw: all proposed or
+                     requested load), so the dashboard's scenario switch covers
+                     the hex tier too
 
   DC_LOAD_MW         existing points (building-footprint MW, scaled up to the
                      provincial floor where one exists) + each province's new
@@ -101,12 +104,14 @@ def dc_points() -> pd.DataFrame:
     return pts
 
 
-def demand(hexes, pts, prov_ts: pd.DataFrame, siting_weights: dict) -> tuple[np.ndarray, dict]:
+def demand(hexes, pts, prov_ts: pd.DataFrame, siting_weights: dict, high: bool = False) -> tuple[np.ndarray, dict]:
     """Existing MW per hex, and {year: new MW per hex}.
 
     New MW per province comes from canada_stress.py (one source of truth); named
-    sites take their share, the rest goes to the province's siting-model hexes
-    (or, if a province has none, to its existing data-centre points)."""
+    sites take their share of the reference case, the rest goes to the province's
+    siting-model hexes (or, if a province has none, to its existing data-centre
+    points). In the high case the named sites keep their own MW and only the
+    extra load goes to the siting model -- the sites are fixed-size projects."""
     idx = assign_to_hex(pts["lon"], pts["lat"], hexes, TO_HEX)
     ok = idx >= 0
     existing = np.bincount(idx[ok], weights=pts["mw"].to_numpy()[ok], minlength=len(hexes))
@@ -117,15 +122,17 @@ def demand(hexes, pts, prov_ts: pd.DataFrame, siting_weights: dict) -> tuple[np.
     for year in TS_YEARS:
         arr = np.zeros(len(hexes))
         for prov in PROVINCES:
-            mw = float(prov_ts["dc_new_mw"].get((prov, year), 0.0))
+            mw_ref = float(prov_ts["dc_new_mw"].get((prov, year), 0.0))
+            mw = (float(prov_ts["dc_load_high_mw"].get((prov, year), 0.0))
+                  - float(prov_ts["dc_existing_mw"].get((prov, year), 0.0))) if high else mw_ref
             if mw <= 0:
                 continue
             in_prov_sites = (sites["province"] == prov).to_numpy()
             placed = 0.0
             for share, h in zip(sites.loc[in_prov_sites, "share_of_new"], site_idx[in_prov_sites]):
-                arr[h] += mw * share
-                placed += share
-            rest = mw * (1 - placed)
+                arr[h] += mw_ref * share
+                placed += mw_ref * share
+            rest = mw - placed
             if rest <= 0:
                 continue
             if prov in siting_weights:
@@ -229,6 +236,40 @@ def load_osm_lines() -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------------
+# Local assessment
+# ----------------------------------------------------------------------------
+def assess(load, headroom, tx, artifact) -> dict:
+    """Stress, gap and class for one year's load against the hexes' headroom."""
+    has_dc = load > 0
+    distribution = has_dc & (load < MIN_DC_MW_FOR_HV) & (tx <= 0)
+    assessed = has_dc & ~distribution
+    with np.errstate(divide="ignore", invalid="ignore"):
+        stress = np.where(assessed & (headroom > 0), load / headroom, 0.0)
+    stress[assessed & (headroom <= 0)] = np.nan
+    gap = np.where(assessed, np.maximum(load - headroom, 0.0), 0.0)
+    capped = np.where(np.isnan(stress), LOCAL_STRESS_CAP, np.minimum(stress, LOCAL_STRESS_CAP))
+    capped[~assessed] = 0.0
+    cls = np.select([~has_dc, distribution, artifact, np.isnan(stress) | (stress > 1), stress >= 0.9],
+                    ["no_dc", "distribution_served", "data_artifact", "gap", "near_limit"], "surplus")
+    gap[artifact] = 0.0
+    capped[artifact] = 0.0
+    return {"stress": stress, "gap": gap, "capped": capped, "cls": cls}
+
+
+def add_gi(ts: pd.DataFrame, gi, gap_col: str = "DC_GAP_MW", suffix: str = "") -> None:
+    """Gi* on gap_col for each year, pooled across years, as GI_*{suffix} columns."""
+    pooled = ts[gap_col].to_numpy()
+    xbar, sd = pooled.mean(), pooled.std()
+    parts = {"GI_Z": [], "GI_P": [], "GI_BIN": [], "GI_PATTERN": []}
+    for year in TS_YEARS:
+        z, p, b = gi(ts.loc[ts["YEAR"] == year, gap_col].to_numpy(), xbar, sd)
+        parts["GI_Z"].append(z), parts["GI_P"].append(p), parts["GI_BIN"].append(b)
+        parts["GI_PATTERN"].append(np.array([GI_LABELS[v] for v in b], dtype=object))
+    for col, chunks in parts.items():
+        ts[col + suffix] = np.concatenate(chunks)
+
+
+# ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
 def main(mode: str = GRID_STRENGTH_MODE, out_dir=OUT_DIR) -> pd.DataFrame:
@@ -266,7 +307,9 @@ def main(mode: str = GRID_STRENGTH_MODE, out_dir=OUT_DIR) -> pd.DataFrame:
     prov_ts = pd.read_csv(OUT_DIR / "canada_stress_index_timeseries.csv").set_index(["province", "year"])
     pts = dc_points()
     existing, new = demand(hexes, pts, prov_ts, siting_weights)
-    print(f"  existing {existing.sum():,.0f} MW; new by 2035 {new[TS_YEARS[-1]].sum():,.0f} MW")
+    _, new_high = demand(hexes, pts, prov_ts, siting_weights, high=True)
+    print(f"  existing {existing.sum():,.0f} MW; new by 2035 {new[TS_YEARS[-1]].sum():,.0f} MW "
+          f"(high case {new_high[TS_YEARS[-1]].sum():,.0f} MW)")
     with_lines = {p for p in PROVINCES if (OSM_LINES_DIR / f"CA-{PROVINCE_ABBREV[p]}.json").exists()}
     prov = hexes["PROVINCE"].to_numpy()
     total_w = pd.Series(share_strength).groupby(prov).transform("sum").to_numpy()
@@ -275,24 +318,13 @@ def main(mode: str = GRID_STRENGTH_MODE, out_dir=OUT_DIR) -> pd.DataFrame:
 
     frames = []
     for year in TS_YEARS:
-        load = existing + new[year]
+        load, load_high = existing + new[year], existing + new_high[year]
         avail = np.array([prov_ts["avail_cap_mw"].get((p, year), np.nan) for p in prov])
         share_mw = avail * share
         headroom = np.maximum(np.nan_to_num(share_mw), existing)
-        has_dc = load > 0
-        distribution = has_dc & (load < MIN_DC_MW_FOR_HV) & (tx <= 0)
-        assessed = has_dc & ~distribution
-        with np.errstate(divide="ignore", invalid="ignore"):
-            stress = np.where(assessed & (headroom > 0), load / headroom, 0.0)
-        stress[assessed & (headroom <= 0)] = np.nan
-        gap = np.where(assessed, np.maximum(load - headroom, 0.0), 0.0)
-        capped = np.where(np.isnan(stress), LOCAL_STRESS_CAP, np.minimum(stress, LOCAL_STRESS_CAP))
-        capped[~assessed] = 0.0
         artifact = np.isin(prov, list(CANADA_ARTIFACT_PROVINCES))
-        cls = np.select([~has_dc, distribution, artifact, np.isnan(stress) | (stress > 1), stress >= 0.9],
-                        ["no_dc", "distribution_served", "data_artifact", "gap", "near_limit"], "surplus")
-        gap[artifact] = 0.0
-        capped[artifact] = 0.0
+        ref, hi = assess(load, headroom, tx, artifact), assess(load_high, headroom, tx, artifact)
+        stress, gap, capped, cls = ref["stress"], ref["gap"], ref["capped"], ref["cls"]
         prov_stress = np.array([prov_ts["stress_index"].get((p, year), np.nan) for p in prov])
         frames.append(pd.DataFrame({
             "HEX_ID": hexes["HEX_ID"], "YEAR": year, "YEAR_DATE": f"{year}-01-01", "PROVINCE": prov,
@@ -304,18 +336,13 @@ def main(mode: str = GRID_STRENGTH_MODE, out_dir=OUT_DIR) -> pd.DataFrame:
             "OSM_LINES": np.isin(prov, list(with_lines)).astype(int),
             "DATA_ARTIFACT_FLAG": artifact.astype(int),
             "SITING_SCORE": siting_score, "HV_SUBSTATIONS": substations, "POP_100KM": gravity,
+            "DC_LOAD_HIGH_MW": load_high, "LOCAL_STRESS_HIGH": hi["stress"], "DC_GAP_HIGH_MW": hi["gap"],
+            "LOCAL_CLASS_HIGH": hi["cls"],
         }))
     ts = pd.concat(frames, ignore_index=True)
 
-    pooled = ts["DC_GAP_MW"].to_numpy()
-    xbar, sd = pooled.mean(), pooled.std()
-    parts = {"GI_Z": [], "GI_P": [], "GI_BIN": [], "GI_PATTERN": []}
-    for year in TS_YEARS:
-        z, p, b = gi(ts.loc[ts["YEAR"] == year, "DC_GAP_MW"].to_numpy(), xbar, sd)
-        parts["GI_Z"].append(z), parts["GI_P"].append(p), parts["GI_BIN"].append(b)
-        parts["GI_PATTERN"].append(np.array([GI_LABELS[v] for v in b], dtype=object))
-    for col, chunks in parts.items():
-        ts[col] = np.concatenate(chunks)
+    add_gi(ts, gi)
+    add_gi(ts, gi, "DC_GAP_HIGH_MW", "_HIGH")
     order = ["HEX_ID", "YEAR", "YEAR_DATE", "PROVINCE", "DC_LOAD_MW", "LOCAL_HEADROOM_MW", "LOCAL_STRESS",
              "DC_GAP_MW", "LOCAL_CLASS", "GI_Z", "GI_P", "GI_BIN", "GI_PATTERN"]
     ts = ts[order + [c for c in ts.columns if c not in order]]
@@ -338,6 +365,9 @@ def main(mode: str = GRID_STRENGTH_MODE, out_dir=OUT_DIR) -> pd.DataFrame:
         dc = y[y["DC_LOAD_MW"] > 0]
         print(f"\n{year}: {dc['LOCAL_CLASS'].value_counts().to_dict()}; gap {y['DC_GAP_MW'].sum():,.0f} MW; "
               f"hot spot hexes {(y['GI_BIN'] > 0).sum()} {y.loc[y['GI_BIN'] > 0, 'PROVINCE'].value_counts().to_dict()}")
+        print(f"  high case: gap {y['DC_GAP_HIGH_MW'].sum():,.0f} MW in {(y['LOCAL_CLASS_HIGH'] == 'gap').sum()} hexes; "
+              f"hot spot hexes {(y['GI_BIN_HIGH'] > 0).sum()} "
+              f"{y.loc[y['GI_BIN_HIGH'] > 0, 'PROVINCE'].value_counts().to_dict()}")
         print(dc.sort_values("DC_GAP_MW", ascending=False).head(6)
               [["HEX_ID", "PROVINCE", "DC_EXISTING_MW", "DC_LOAD_MW", "LOCAL_HEADROOM_MW", "DC_GAP_MW", "LOCAL_CLASS"]]
               .to_string(index=False, float_format=lambda v: f"{v:,.0f}"))
