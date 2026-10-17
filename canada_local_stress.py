@@ -50,13 +50,14 @@ from sklearn.neighbors import BallTree
 from config import (
     CA_HEX_CRS, CA_SITING_GRAVITY_RADIUS_M, CA_SITING_GRAVITY_WEIGHT, CA_SITING_TOP_K,
     CANADA_ARTIFACT_PROVINCES, CANADA_DC_EXISTING_FLOOR_MW, CANADA_DC_SITES, PROVINCE_ABBREV,
-    CANADA_PEAK_LOAD_2025_MW, GI_DISTANCE_M, LOCAL_STRESS_CAP, MIN_DC_MW_FOR_HV, MIN_LINE_KV,
-    NACEI_PLANT_FILES, OSM_LINES_DIR, OUT_DIR, STATCAN_PROVINCES_ZIP, TS_YEARS,
+    CANADA_PEAK_LOAD_2025_MW, GI_DISTANCE_M, GRID_STRENGTH_MODE, GRID_STRENGTH_MODES, LOCAL_STRESS_CAP,
+    MIN_DC_MW_FOR_HV, MIN_LINE_KV, NACEI_PLANT_FILES, OSM_LINES_DIR, OUT_DIR, PLANT_SWITCHYARD_MIN_MW,
+    STATCAN_PROVINCES_ZIP, TS_YEARS,
 )
 from geo import read_prj_from_zip
 from local_stress import (
-    GI_LABELS, GiStar, assign_to_hex, hex_grid, line_rating, load_osm_substations, osm_kv,
-    transmission_capacity,
+    GI_LABELS, GiStar, assign_to_hex, drop_plant_switchyards, grid_strength, hex_grid, line_rating,
+    load_osm_substations, osm_kv, transmission_capacity,
 )
 
 WGS84 = "EPSG:4326"
@@ -187,7 +188,8 @@ def siting_model(hexes, strength, substations, gravity) -> tuple[np.ndarray, dic
 # ----------------------------------------------------------------------------
 # Supply
 # ----------------------------------------------------------------------------
-def plant_capacity(hexes) -> np.ndarray:
+def plant_capacity(hexes) -> tuple[np.ndarray, np.ndarray]:
+    """Plant MW per hex, and (x, y) of plants >= PLANT_SWITCHYARD_MIN_MW in the hex CRS."""
     frames = []
     for path in NACEI_PLANT_FILES:
         with open(path, encoding="utf-8") as f:
@@ -199,7 +201,9 @@ def plant_capacity(hexes) -> np.ndarray:
     idx = assign_to_hex(plants["Longitude"], plants["Latitude"], hexes, TO_HEX)
     ok = idx >= 0
     print(f"  {len(plants)} NACEI plants, {plants.loc[ok, 'Total_MW'].sum():,.0f} MW inside the grid")
-    return np.bincount(idx[ok], weights=plants["Total_MW"].to_numpy()[ok], minlength=len(hexes))
+    big = plants[plants["Total_MW"] >= PLANT_SWITCHYARD_MIN_MW]
+    plant_xy = np.column_stack(TO_HEX.transform(big["Longitude"].to_numpy(), big["Latitude"].to_numpy()))
+    return np.bincount(idx[ok], weights=plants["Total_MW"].to_numpy()[ok], minlength=len(hexes)), plant_xy
 
 
 def load_osm_lines() -> pd.DataFrame:
@@ -227,21 +231,30 @@ def load_osm_lines() -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
-def main():
-    print("Building Canadian hex grid ...")
+def main(mode: str = GRID_STRENGTH_MODE, out_dir=OUT_DIR) -> pd.DataFrame:
+    """Writes the hex CSV (and grid GeoJSON) to out_dir. A non-default `mode` is a
+    grid-strength sensitivity run (grid_strength_sensitivity.py)."""
+    assert mode in GRID_STRENGTH_MODES, mode
+    print(f"Building Canadian hex grid ... (grid strength: {mode})")
     names, geoms = province_shapes()
     hexes = hex_grid(names, geoms, TO_WGS).rename(columns={"STATE": "PROVINCE"})
     hexes["HEX_ID"] = hexes["HEX_ID"].str.replace("H", "C", n=1)
     print(f"  {len(hexes):,} hexes across {len(names)} provinces")
 
     print("Supply ...")
-    plants = plant_capacity(hexes)
+    plants, plant_xy = plant_capacity(hexes)
     lines = load_osm_lines()
     sub_xy = load_osm_substations(sorted(OSM_LINES_DIR.glob("subs-CA-*.json")), TO_HEX)
     print(f"  {len(sub_xy):,} OSM substations >= {MIN_LINE_KV} kV")
     tx, _, _, substations = transmission_capacity(hexes, lines, sub_xy)
     print(f"  {len(lines):,} OSM lines >= {MIN_LINE_KV} kV; {(tx > 0).sum():,} hexes reach one")
     strength = plants + tx
+    # The siting model keeps the default strength, so a sensitivity run moves only
+    # the headroom shares, not where the new load is placed.
+    tx_share = tx
+    if mode == "no_plant_switchyards":
+        tx_share = transmission_capacity(hexes, lines, drop_plant_switchyards(sub_xy, plant_xy))[0]
+    share_strength = grid_strength(plants, tx_share, mode)
 
     print("Siting model ...")
     gravity = market_gravity(hexes)
@@ -256,8 +269,8 @@ def main():
     print(f"  existing {existing.sum():,.0f} MW; new by 2035 {new[TS_YEARS[-1]].sum():,.0f} MW")
     with_lines = {p for p in PROVINCES if (OSM_LINES_DIR / f"CA-{PROVINCE_ABBREV[p]}.json").exists()}
     prov = hexes["PROVINCE"].to_numpy()
-    total_w = pd.Series(strength).groupby(prov).transform("sum").to_numpy()
-    share = np.where(total_w > 0, strength / total_w, 0.0)
+    total_w = pd.Series(share_strength).groupby(prov).transform("sum").to_numpy()
+    share = np.where(total_w > 0, share_strength / total_w, 0.0)
     gi = GiStar(shapely.get_coordinates(shapely.centroid(hexes["geometry"].to_numpy())), GI_DISTANCE_M)
 
     frames = []
@@ -286,7 +299,7 @@ def main():
             "DC_LOAD_MW": load, "LOCAL_HEADROOM_MW": headroom, "LOCAL_STRESS": stress, "DC_GAP_MW": gap,
             "LOCAL_CLASS": cls, "LOCAL_STRESS_CAPPED": capped,
             "DC_EXISTING_MW": existing, "DC_NEW_MW": new[year],
-            "GRID_STRENGTH_MW": strength, "PLANT_MW": plants, "TX_CAPACITY_MW": tx,
+            "GRID_STRENGTH_MW": share_strength, "PLANT_MW": plants, "TX_CAPACITY_MW": tx,
             "PROVINCE_HEADROOM_SHARE_MW": share_mw, "PROVINCE_STRESS_INDEX": prov_stress,
             "OSM_LINES": np.isin(prov, list(with_lines)).astype(int),
             "DATA_ARTIFACT_FLAG": artifact.astype(int),
@@ -306,7 +319,9 @@ def main():
     order = ["HEX_ID", "YEAR", "YEAR_DATE", "PROVINCE", "DC_LOAD_MW", "LOCAL_HEADROOM_MW", "LOCAL_STRESS",
              "DC_GAP_MW", "LOCAL_CLASS", "GI_Z", "GI_P", "GI_BIN", "GI_PATTERN"]
     ts = ts[order + [c for c in ts.columns if c not in order]]
-    ts.to_csv(OUT_DIR / "ca_hex_local_stress_2025_2035.csv", index=False, float_format="%.4f")
+    ts.to_csv(out_dir / "ca_hex_local_stress_2025_2035.csv", index=False, float_format="%.4f")
+    if out_dir != OUT_DIR:
+        return ts
 
     wgs = shapely.transform(hexes["geometry"].to_numpy(),
                             lambda xy: np.column_stack(TO_WGS.transform(xy[:, 0], xy[:, 1])))
@@ -326,6 +341,7 @@ def main():
         print(dc.sort_values("DC_GAP_MW", ascending=False).head(6)
               [["HEX_ID", "PROVINCE", "DC_EXISTING_MW", "DC_LOAD_MW", "LOCAL_HEADROOM_MW", "DC_GAP_MW", "LOCAL_CLASS"]]
               .to_string(index=False, float_format=lambda v: f"{v:,.0f}"))
+    return ts
 
 
 if __name__ == "__main__":

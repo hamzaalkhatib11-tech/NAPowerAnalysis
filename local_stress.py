@@ -69,9 +69,10 @@ from shapely.geometry import shape as shapely_shape
 from sklearn.neighbors import BallTree
 
 from config import (
-    GI_DISTANCE_M, GI_FDR, EIA_PLANNED_STATUSES, EXCLUDED_STATES, GROWTH_PUE, HEX_CRS, HEX_WIDTH_M,
+    GI_DISTANCE_M, GI_FDR, EIA_PLANNED_STATUSES, EXCLUDED_STATES, GRID_STRENGTH_MODE, GRID_STRENGTH_MODES,
+    GROWTH_PUE, HEX_CRS, HEX_WIDTH_M,
     LINE_KV_VALID, LINE_RATING_FIT, SUBSTATION_SNAP_M, US_SUBSTATIONS_DIR, LOCAL_STRESS_CAP, MIN_DC_MW_FOR_HV, MIN_LINE_KV, OUT_DIR, TIGER_STATES_ZIP,
-    TRANSMISSION_ZIP, TREND_HISTORY_YEARS, TS_YEARS,
+    PLANT_SWITCHYARD_MIN_MW, PLANT_SWITCHYARD_RADIUS_M, TRANSMISSION_ZIP, TREND_HISTORY_YEARS, TS_YEARS,
 )
 from geo import join_ba, load_control_areas, read_prj_from_zip
 from us_time_series import load_generators, ramp
@@ -170,9 +171,8 @@ def new_load_2035(hexes) -> np.ndarray:
 # ----------------------------------------------------------------------------
 # Supply
 # ----------------------------------------------------------------------------
-def local_generation(hexes) -> dict:
+def local_generation(hexes, sheets: dict) -> dict:
     """{year: MW per hex}, including the BA build-rate top-up sited like 2021-2025 builds."""
-    sheets = load_generators()
     op, pl, rt = sheets["Operating"], sheets["Planned"], sheets["Retired"]
     pl = pl[pl["Status"].astype(str).str.startswith(EIA_PLANNED_STATUSES)]
     units = pd.concat([
@@ -202,6 +202,27 @@ def local_generation(hexes) -> dict:
         gen[by_hex.index.to_numpy()] += by_hex.to_numpy()
         out[year] = gen
     return out
+
+
+def plant_points(sheets: dict) -> np.ndarray:
+    """(x, y) in the hex CRS of operating plants >= PLANT_SWITCHYARD_MIN_MW (one point per plant)."""
+    op = sheets["Operating"].dropna(subset=["Latitude", "Longitude"])
+    plants = op.groupby("Plant ID").agg(mw=("mw", "sum"), lat=("Latitude", "first"), lon=("Longitude", "first"))
+    plants = plants[plants["mw"] >= PLANT_SWITCHYARD_MIN_MW]
+    return np.column_stack(TO_HEX.transform(plants["lon"].to_numpy(), plants["lat"].to_numpy()))
+
+
+def drop_plant_switchyards(sub_xy: np.ndarray, plant_xy: np.ndarray) -> np.ndarray:
+    """Substations, minus those within PLANT_SWITCHYARD_RADIUS_M of a plant (its switchyard)."""
+    near = BallTree(plant_xy).query_radius(sub_xy, r=PLANT_SWITCHYARD_RADIUS_M, count_only=True) > 0
+    print(f"  {near.sum():,} of {len(sub_xy):,} substations treated as plant switchyards")
+    return sub_xy[~near]
+
+
+def grid_strength(gen: np.ndarray, tx: np.ndarray, mode: str) -> np.ndarray:
+    """Plant MW and delivering-line MW combined per config.GRID_STRENGTH_MODE. For
+    "no_plant_switchyards", tx must already exclude lines reaching only a switchyard."""
+    return np.maximum(gen, tx) if mode == "max" else gen + tx
 
 
 def line_rating(kv: float) -> float:
@@ -350,8 +371,11 @@ GI_LABELS = {3: "Hot Spot - 99% Confidence", 2: "Hot Spot - 95% Confidence", 1: 
 # ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
-def main():
-    print("Building hex grid ...")
+def main(mode: str = GRID_STRENGTH_MODE, out_dir=OUT_DIR) -> pd.DataFrame:
+    """Writes the hex CSV (and grid GeoJSON) to out_dir. A non-default `mode` is a
+    grid-strength sensitivity run (grid_strength_sensitivity.py)."""
+    assert mode in GRID_STRENGTH_MODES, mode
+    print(f"Building hex grid ... (grid strength: {mode})")
     names, geoms = conus_states()
     hexes = hex_grid(names, geoms)
     control_areas = load_control_areas()
@@ -370,7 +394,13 @@ def main():
     print(f"  {len(sub_xy):,} OSM substations >= {MIN_LINE_KV} kV")
     tx, n_lines, max_kv, n_subs = transmission_capacity(hexes, lines, sub_xy)
     print(f"  {len(lines):,} lines >= {MIN_LINE_KV} kV; {(tx > 0).sum():,} hexes reach one")
-    gen = local_generation(hexes)
+    sheets = load_generators()
+    gen = local_generation(hexes, sheets)
+    # lines counted toward grid strength; `tx` itself (any delivering line) still
+    # decides which small sites are distribution-served, so only the share changes
+    tx_strength = tx
+    if mode == "no_plant_switchyards":
+        tx_strength = transmission_capacity(hexes, lines, drop_plant_switchyards(sub_xy, plant_points(sheets)))[0]
     gi = GiStar(shapely.get_coordinates(shapely.centroid(hexes["geometry"].to_numpy())), GI_DISTANCE_M)
 
     ba_ts = pd.read_csv(OUT_DIR / "us_ba_time_series_2025_2035.csv").set_index(["BA_NAME", "YEAR"])
@@ -379,7 +409,7 @@ def main():
     frames = []
     for year in TS_YEARS:
         load = dc_existing + dc_new * ramp(year)
-        strength = gen[year] + tx
+        strength = grid_strength(gen[year], tx_strength, mode)
         share_mw = allocate_ba_value(hexes, strength, ba_ts["AVAIL_CAP_MW"], year)
         no_cap = np.isnan(share_mw)
         # what runs today is served (the lights are on), so a hex's headroom is at
@@ -427,7 +457,9 @@ def main():
     order = ["HEX_ID", "YEAR", "YEAR_DATE", "STATE", "BA_NAME", "DC_LOAD_MW", "LOCAL_HEADROOM_MW",
              "LOCAL_STRESS", "DC_GAP_MW", "LOCAL_CLASS", "GI_Z", "GI_P", "GI_BIN", "GI_PATTERN"]
     ts = ts[order + [c for c in ts.columns if c not in order]]
-    ts.to_csv(OUT_DIR / "us_hex_local_stress_2025_2035.csv", index=False, float_format="%.4f")
+    ts.to_csv(out_dir / "us_hex_local_stress_2025_2035.csv", index=False, float_format="%.4f")
+    if out_dir != OUT_DIR:
+        return ts
 
     wgs = shapely.transform(hexes["geometry"].to_numpy(),
                             lambda xy: np.column_stack(TO_WGS.transform(xy[:, 0], xy[:, 1])))
@@ -453,6 +485,7 @@ def main():
         print(dc.sort_values("DC_GAP_MW", ascending=False).head(8)
               [["HEX_ID", "STATE", "BA_NAME", "DC_EXISTING_MW", "DC_LOAD_MW", "LOCAL_HEADROOM_MW",
                 "DC_GAP_MW", "LOCAL_CLASS"]].to_string(index=False, float_format=lambda v: f"{v:,.0f}"))
+    return ts
 
 
 if __name__ == "__main__":

@@ -246,6 +246,17 @@ LINE_KV_VALID = (1, 1100)       # HIFLD uses -999999 for unknown voltage
 # through, with no substation, serve somewhere else and count for nothing.
 US_SUBSTATIONS_DIR = DATA_DIR / "osm_us_substations"
 SUBSTATION_SNAP_M = 1000.0
+# How grid strength combines plants and lines (grid_strength_sensitivity.py runs all three):
+#   "sum"                  plant MW + delivering-line MW (the default)
+#   "no_plant_switchyards" as "sum", but a substation within PLANT_SWITCHYARD_RADIUS_M
+#                          of a plant >= PLANT_SWITCHYARD_MIN_MW is treated as that
+#                          plant's switchyard, so lines reaching only it (its export
+#                          lines) don't count -- the plant's power is counted once
+#   "max"                  max(plant MW, line MW), so the two are never added
+GRID_STRENGTH_MODE = "sum"
+GRID_STRENGTH_MODES = ("sum", "no_plant_switchyards", "max")
+PLANT_SWITCHYARD_RADIUS_M = 1500.0   # <-- REVIEW: EIA/NACEI give one point per plant
+PLANT_SWITCHYARD_MIN_MW = 50.0
 # Yearly hot spots of capacity gaps (Getis-Ord Gi*, binary weights within this
 # distance, self included). 75 km = the two rings of hexes around each hex
 # (~18 neighbours), roughly a metro area or a utility planning zone.

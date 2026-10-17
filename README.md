@@ -15,6 +15,7 @@ Background, data sources and methodology are in [PROJECT_HANDOFF.md](PROJECT_HAN
 | `canada_local_stress.py` | The same local gaps and yearly hot spots for 9 provinces (11,831 hexes), with a siting model for new load |
 | `export_gis.py` | Joins the time series to BA and province polygons and writes time-enabled layers to `output/gis/` (File Geodatabase, zipped copy, GeoJSON) |
 | `sensitivity.py` | Re-runs the U.S. steps at 100 and 200 W/ft² and writes `output/sensitivity/w_per_sqft_summary.csv` (run separately, about 8 minutes) |
+| `grid_strength_sensitivity.py` | Re-runs both hex tiers with the two plant/line double-count fixes and writes `output/sensitivity/grid_strength_comparison.csv` (run separately) |
 | `geo.py` | Shared point-in-polygon helpers |
 | `verify_outputs.py` | Diffs `output/` against `reference_outputs/`, then checks invariants and the time series |
 | `run_pipeline.py` | Runs all of the above in order |
@@ -83,6 +84,25 @@ The BA index says whether a region has headroom. The hex index says whether the 
   - Gross line ratings found almost no gaps, because they count power passing through a hex as if it were available there.
   - Spreading peak demand by Census population marked nearly every city as short before any data centre was built.
 - **It's a screening model, not a power-flow study.**
+
+**Plant/line double count (`grid_strength_sensitivity.py`).** A plant's export lines reach its own switchyard, which OSM maps as a substation. So a plant's power can count twice in grid strength: once as the plant and again as the lines carrying it away. Grid strength only sets each hex's share of headroom, so this can move headroom between hexes but can't change the totals. `GRID_STRENGTH_MODE` in `config.py` selects:
+
+- `sum`: plants plus lines. This is the default.
+- `no_plant_switchyards`: lines that reach only a substation within 1.5 km of a plant of 50 MW or more don't count. That excludes 3,794 of 31,665 U.S. substations and 237 of 2,190 Canadian ones.
+- `max`: the larger of plant MW or line MW in each hex.
+
+Results for 2035 (run on 2026-10-17):
+
+| | `sum` | `no_plant_switchyards` | `max` |
+|---|---|---|---|
+| U.S. gap hexes | 93 | 90 (86 the same) | 91 (91 the same) |
+| U.S. gap MW | 23,723 | 22,371 (−6%) | 23,287 (−2%) |
+| U.S. hot spot hexes | 989 | 945 (938 the same) | 985 (985 the same) |
+| Canada gap hexes / hot spot hexes | 1 / 34 | 2 / 34 | 1 / 34 |
+
+- Both fixes move headroom toward data-centre hexes: +5% and +3% respectively, because few data-centre hexes hold big plants. So the default is slightly pessimistic.
+- The main hot spot regions don't change: Virginia, Texas, California, Arizona, Oregon.
+- **The exception is Nevada.** Its 25-hex hot spot disappears under `no_plant_switchyards`. It rests on a single Las Vegas-area hex, whose gap falls from 302 to 209 MW.
 
 ## Canada
 
