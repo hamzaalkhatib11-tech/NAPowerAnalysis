@@ -21,16 +21,18 @@ Background, data sources and methodology are in [PROJECT_HANDOFF.md](PROJECT_HAN
 | `run_pipeline.py` | Runs all of the above in order |
 | `data/` | Raw inputs (git-ignored) |
 | `output/` | Generated results (git-ignored) |
+| `results/` | A copy of the main result tables from the latest run, so they can be read without running the pipeline (see `results/README.md`) |
+| `requirements.txt` | Python packages and the versions used |
 | `reference_outputs/` | The sandbox-run CSVs behind the handoff's §6 numbers |
 
 ## Run
 
 ```
-pip install pandas numpy pyproj shapely pyshp scikit-learn openpyxl
+pip install -r requirements.txt
 python run_pipeline.py
 ```
 
-The full run takes about 17 minutes, mostly loading footprint tiles. Pass `--skip-footprint` to reuse the existing Canadian footprint results.
+The full run takes about 17 minutes, mostly loading footprint tiles. Pass `--skip-footprint` to reuse the existing Canadian footprint matches (`output/canada_dc_with_mw.csv`); the province summary is still rebuilt from them.
 
 ## Inputs expected in `data/`
 
