@@ -157,8 +157,8 @@ CANADA_DC_NEW_HIGH_MW = {
     "British Columbia": None,   # legislated caps -> same as reference
 }
 # Named projects with a known site; the rest of a province's new load goes to
-# its existing data-centre points in proportion to their MW. Coordinates are
-# approximate (municipality / site level).
+# the siting model's top hexes (CA_SITING_*), or to its existing data-centre
+# points if it has no eligible hex. Coordinates are approximate (municipality / site level).
 CANADA_DC_SITES = [
     {"name": "Meta campus (Industrial Heartland)", "province": "Alberta", "lat": 53.80, "lon": -113.25,
      "share_of_new": 970 / 1200},

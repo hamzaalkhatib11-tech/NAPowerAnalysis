@@ -11,6 +11,8 @@ Footprint tiles (PROJECT_HANDOFF.md §4). For each Canadian point:
 Reads output/harmonized_existing_dc_with_ba.csv (from harmonize_datacenters.py).
 Writes output/canada_building_footprint_tiles_needed.csv,
        output/canada_dc_with_mw.csv and a refreshed output/canada_dc_by_province.csv.
+--summary-only rebuilds just canada_dc_by_province.csv from an existing
+canada_dc_with_mw.csv (no tiles read).
 
 Tiles live in data/ as part-*.csv.gz. Their filenames only carry a Spark
 part number, which is NOT unique across quadkeys (part-00179 is both Calgary
@@ -20,6 +22,7 @@ and Montreal), so a tile is matched to its quadkey by reading its content.
 import gzip
 import json
 import re
+import sys
 
 import numpy as np
 import pandas as pd
@@ -158,7 +161,11 @@ def main():
     ca.to_csv(OUT_DIR / "canada_dc_with_mw.csv", index=False)
     matched = (ca["mw_method"] == "footprint_derived").sum()
     print(f"{matched} / {len(ca)} Canadian points got a footprint-derived MW estimate")
+    write_province_summary(ca)
 
+
+def write_province_summary(ca: pd.DataFrame) -> None:
+    """canada_dc_by_province.csv from the footprint MW, replacing harmonize's MW-less placeholder."""
     summary = (
         ca.groupby("joined_province", dropna=True)
         .agg(facility_count=("mw_estimate", "size"),
@@ -171,4 +178,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--summary-only" in sys.argv:
+        # run_pipeline.py --skip-footprint: reuse the matched points, but harmonize has
+        # just rewritten the province summary without MW, so rebuild it
+        write_province_summary(pd.read_csv(OUT_DIR / "canada_dc_with_mw.csv"))
+    else:
+        main()

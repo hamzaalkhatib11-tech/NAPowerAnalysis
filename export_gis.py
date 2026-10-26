@@ -6,7 +6,7 @@ time-enabled layers to output/gis/:
 
   ggr442_grid_stress.gdb   File Geodatabase (open in ArcGIS Pro, publish to ArcGIS Online)
     us_ba_stress_timeseries        70 HIFLD BAs x 2025-2035 (770 polygons), YEAR_DATE is a Date field
-    ca_province_stress_timeseries  6 provinces x 2025-2035 (66 polygons), same schema
+    ca_province_stress_timeseries  9 provinces x 2025-2035 (99 polygons), same schema
     dc_existing_points             deduplicated existing data centres (2025 layer)
     dc_growth_sites_2035           IM3 projected new sites (high growth, 50% gravity)
     us_hex_local_stress_timeseries 15,431 hexes x 2025-2035 (local_stress.py); feed
