@@ -1,6 +1,8 @@
 # Raw inputs are large and re-downloadable; see PROJECT_HANDOFF.md §3 for sources.
 data/
 *.zip
+# except the published ArcGIS geodatabase
+!gis/ggr442_grid_stress.gdb.zip
 part-*.gz
 *.csv.gz
 

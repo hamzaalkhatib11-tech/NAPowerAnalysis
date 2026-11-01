@@ -23,6 +23,7 @@ Background, data sources and methodology are in [PROJECT_HANDOFF.md](PROJECT_HAN
 | `output/` | Generated results (git-ignored) |
 | `results/` | A copy of the main result tables from the latest run, so they can be read without running the pipeline (see `results/README.md`) |
 | `requirements.txt` | Python packages and the versions used |
+| `gis/ggr442_grid_stress.gdb.zip` | The ArcGIS File Geodatabase with all map layers (time-enabled BA, province and hex layers, data-centre points, transmission lines). Unzip and add to ArcGIS Pro, or upload the zip to ArcGIS Online as a File Geodatabase item |
 | `reference_outputs/` | The sandbox-run CSVs behind the handoff's §6 numbers |
 
 ## Run

@@ -14,6 +14,5 @@ regenerates them in `output/`; these copies are not updated automatically.
 | `us_ba_peak_2025.csv` | 2025 system peak per BA: EIA-930 vs HIFLD and which was used |
 | `canada_dc_with_mw.csv` | Canadian data centres with building-footprint MW |
 
-The 25 km hex results (`us_hex_local_stress_2025_2035.csv`, `ca_hex_local_stress_2025_2035.csv`,
-about 35 MB each) and the ArcGIS geodatabase are too large for this repository; they are
-shared through the project's ArcGIS Online maps.
+The 25 km hex results are not copied here as CSVs (about 35 MB each); they are layers in
+the geodatabase, `gis/ggr442_grid_stress.gdb.zip`.
